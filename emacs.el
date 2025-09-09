@@ -89,3 +89,23 @@
 ;; Optional: highlight current line's hunk in fringe
 (setq diff-hl-fringe-face-function
       'diff-hl-fringe-face-from-type)
+
+;; Force Ediff to use horizontal (side-by-side) split
+(setq ediff-split-window-function 'split-window-horizontally)
+(setq ediff-window-setup-function 'ediff-setup-windows-plain)
+
+(use-package swiper
+  :ensure t
+  :bind (("C-s" . swiper)        ;; search in current buffer
+         ("C-r" . swiper)        ;; backwards search
+         ("C-c C-s" . swiper-all))) ;; search across all open buffers
+
+;; Force Ediff to use horizontal (side-by-side) split
+(setq ediff-split-window-function 'split-window-horizontally)
+(setq ediff-window-setup-function 'ediff-setup-windows-plain)
+
+(use-package swiper
+  :ensure t
+  :bind (("C-s" . swiper)        ;; search in current buffer
+         ("C-r" . swiper)        ;; backwards search
+         ("C-c C-s" . swiper-all))) ;; search across all open buffers
