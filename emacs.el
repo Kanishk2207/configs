@@ -109,3 +109,6 @@
   :bind (("C-s" . swiper)        ;; search in current buffer
          ("C-r" . swiper)        ;; backwards search
          ("C-c C-s" . swiper-all))) ;; search across all open buffers
+
+;; redo
+(global-set-key (kbd "M-/") 'undo-tree-redo)
