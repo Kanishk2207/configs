@@ -1,0 +1,13 @@
+1. install iterm2
+2. install .oh-my-zsh
+3. install plugins
+           plugins are:
+         73 plugins=(git
+         74         zsh-autosuggestions
+         75         zsh-syntax-highlighting
+         76         you-should-use
+         77         fast-syntax-highlighting
+         78         zsh-bat)
+
+
+4. install tmux
