@@ -266,4 +266,15 @@
 (modify-all-frames-parameters '((scroll-bar-width . 4)))
 
 (fringe-mode 4)
+
+
+;; kill ring delete
+(defun kill-ring-delete-entry (string)
+  "Delete STRING from the kill-ring."
+  (interactive
+   (list (completing-read "Delete from kill-ring: " kill-ring)))
+  (setq kill-ring (delete string kill-ring))
+  (message "Deleted: %s" string))
+
+
 ;;; kanishk-conf.el ends here
