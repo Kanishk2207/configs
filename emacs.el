@@ -5,7 +5,7 @@
 ;; ====================
 (defun my/gui-setup (frame)
   (with-selected-frame frame
-    ;; Theme
+    ;; Disable previous theme and load Wombat
     (mapc #'disable-theme custom-enabled-themes)
     (load-theme 'wombat t)
 
@@ -16,8 +16,8 @@
 
     ;; Git diff fringes
     (global-diff-hl-mode +1)
-    (diff-hl-dired-mode)
-    ))
+    (diff-hl-dired-mode)))
+
 
 (if (daemonp)
     (add-hook 'after-make-frame-functions #'my/gui-setup)
@@ -267,8 +267,9 @@
 
 (fringe-mode 4)
 
-
-;; kill ring delete
+;; ====================
+;; Kill ring delete
+;; ====================
 (defun kill-ring-delete-entry (string)
   "Delete STRING from the kill-ring."
   (interactive
@@ -276,5 +277,56 @@
   (setq kill-ring (delete string kill-ring))
   (message "Deleted: %s" string))
 
+
+;; ====================
+;; set selection yellow
+;; ====================
+(defun my/set-region-color (&rest _)
+  "Force region (selection) to yellow regardless of theme."
+  (set-face-attribute 'region nil
+                      :background "yellow"
+                      :foreground "black"))
+
+;; Apply once immediately
+(my/set-region-color)
+
+;; Reapply after theme loads
+(advice-add 'load-theme :after #'my/set-region-color)
+
+;; Reapply when a new frame is created (daemon-safe)
+(add-hook 'after-make-frame-functions
+          (lambda (frame)
+            (with-selected-frame frame
+              (my/set-region-color))))
+
+
+;; ====================
+;; change ace window shortcut to C-c o
+;; ====================
+(define-key prelude-mode-map (kbd "C-c o") nil)
+
+;; Rebind ace-window
+(global-set-key (kbd "C-c o") 'ace-window)
+
+
+;; ====================
+;; set trailing whitespace to grey instead of yellow
+;; ====================
+(with-eval-after-load 'whitespace
+  ;; Trailing spaces → red
+  (set-face-attribute 'whitespace-trailing nil
+                      :background "red"
+                      :foreground nil)
+
+  ;; Empty lines at buffer end → grey
+  (set-face-attribute 'whitespace-empty nil
+                      :background "grey20"
+                      :foreground nil)
+
+  ;; Tabs → subtle grey underline
+  (set-face-attribute 'whitespace-tab nil
+                      :background nil
+                      :underline t
+                      :foreground "dim gray"))
 
 ;;; kanishk-conf.el ends here
