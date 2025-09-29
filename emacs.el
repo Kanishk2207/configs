@@ -329,4 +329,9 @@
                       :underline t
                       :foreground "dim gray"))
 
+;; set key-bindings for cursor below and cursor above
+(global-set-key (kbd "C->") 'mc/mark-next-like-this)
+(global-set-key (kbd "C-<") 'mc/mark-previous-like-this)
+
+
 ;;; kanishk-conf.el ends here
