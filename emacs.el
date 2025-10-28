@@ -327,11 +327,28 @@
   (set-face-attribute 'whitespace-tab nil
                       :background nil
                       :underline t
-                      :foreground "dim gray"))
+                      :foreground "dim gray")
+
+  (set-face-attribute 'whitespace-indentation nil
+                      :background nil
+                      :foreground nil))
 
 ;; set key-bindings for cursor below and cursor above
 (global-set-key (kbd "C->") 'mc/mark-next-like-this)
 (global-set-key (kbd "C-<") 'mc/mark-previous-like-this)
 
+;; flycher limit change
+(with-eval-after-load 'flycheck
+  (setq flycheck-checker-error-threshold 2000))
+
+(require 'smooth-scroll)
+(smooth-scroll-mode 1)
+
+;; No margins, allow cursor to reach top/bottom
+(setq scroll-margin 0)
+(setq smooth-scroll-margin 0)
+
+;; Set font size globally
+(set-face-attribute 'default nil :height 105)
 
 ;;; kanishk-conf.el ends here
