@@ -341,12 +341,17 @@
 (with-eval-after-load 'flycheck
   (setq flycheck-checker-error-threshold 2000))
 
-(require 'smooth-scroll)
-(smooth-scroll-mode 1)
-
-;; No margins, allow cursor to reach top/bottom
-(setq scroll-margin 0)
-(setq smooth-scroll-margin 0)
+; for smooth scrolling
+(use-package pixel-scroll
+  :bind
+  ([remap scroll-up-command]   . pixel-scroll-interpolate-down)
+  ([remap scroll-down-command] . pixel-scroll-interpolate-up)
+  :custom
+  (pixel-scroll-precision-interpolate-page t)
+  (pixel-scroll-precision-use-momentum t)
+  (pixel-scroll-precision-interpolation-factor 0.00005)
+  :init
+  (pixel-scroll-precision-mode 1))
 
 ;; Set font size globally
 (set-face-attribute 'default nil :height 105)
