@@ -334,8 +334,12 @@
                       :foreground nil))
 
 ;; set key-bindings for cursor below and cursor above
-(global-set-key (kbd "C->") 'mc/mark-next-like-this)
-(global-set-key (kbd "C-<") 'mc/mark-previous-like-this)
+(use-package multiple-cursors
+  :ensure t
+  :bind
+  (("C->" . mc/mark-next-like-this)
+   ("C-<" . mc/mark-previous-like-this)
+   ("C-S-c C-S-c" . mc/edit-lines)))
 
 ;; flycher limit change
 (with-eval-after-load 'flycheck
@@ -355,5 +359,68 @@
 
 ;; Set font size globally
 (set-face-attribute 'default nil :height 105)
+
+;; ====================
+;; Magit window split direction
+;; ====================
+(with-eval-after-load 'magit
+  ;; Open magit-status buffer in a vertical split (on the right)
+  (setq magit-display-buffer-function
+        (lambda (buffer)
+          (display-buffer
+           buffer
+           (cond
+            ;; if we’re in a window already showing Magit, reuse it
+            ((derived-mode-p 'magit-mode)
+             (display-buffer-same-window buffer nil))
+            ;; otherwise, show Magit buffer on the right side
+            (t
+             (display-buffer-in-side-window
+              buffer '((side . right)
+                       (window-width . 0.5)
+                       (slot . 0)))))))))
+
+
+;; ---------- Corfu Setup ----------
+(use-package corfu
+  :ensure t
+  :init
+  (global-corfu-mode)
+  (corfu-popupinfo-mode) ;; optional docs popup
+  :custom
+  ;; Popup behavior
+  (corfu-cycle t)
+  (corfu-auto t)
+  (corfu-auto-prefix 2)
+  (corfu-preselect 'first)
+  (corfu-scroll-margin 4)
+
+  ;; Quit and preview controls
+  (corfu-quit-at-boundary 'separator)
+  (corfu-quit-no-match 'separator)
+  (corfu-preview-current nil)
+
+  ;; Aesthetic tweaks
+  (corfu-min-width 20)
+  (corfu-max-width 80)
+  (corfu-count 14)
+
+  :bind
+  (:map corfu-map
+        ("C-n" . corfu-next)
+        ("C-p" . corfu-previous)
+        ("<down>" . corfu-next)
+        ("<up>" . corfu-previous)
+        ("M-RET" . corfu-insert)
+        ("RET" . corfu-insert)   ;; ✅ Make Return insert selected completion
+        ("TAB" . corfu-next)
+        ("S-TAB" . corfu-previous)))
+
+;; ---------- LSP Integration ----------
+(with-eval-after-load 'lsp-mode
+  (setq lsp-completion-provider :none)) ;; Disable LSP’s minibuffer completions
+
+(add-hook 'lsp-mode-hook #'corfu-mode)
+
 
 ;;; kanishk-conf.el ends here
