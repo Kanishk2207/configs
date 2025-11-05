@@ -307,7 +307,7 @@
 
 ;; Rebind ace-window
 (global-set-key (kbd "C-c o") 'ace-window)
-
+(global-set-key (kbd "C-c C-o") 'ace-window)
 
 ;; ====================
 ;; set trailing whitespace to grey instead of yellow
@@ -364,21 +364,13 @@
 ;; Magit window split direction
 ;; ====================
 (with-eval-after-load 'magit
-  ;; Open magit-status buffer in a vertical split (on the right)
+  ;; Always show Magit in a side-by-side (vertical) split on the right
   (setq magit-display-buffer-function
         (lambda (buffer)
-          (display-buffer
-           buffer
-           (cond
-            ;; if we’re in a window already showing Magit, reuse it
-            ((derived-mode-p 'magit-mode)
-             (display-buffer-same-window buffer nil))
-            ;; otherwise, show Magit buffer on the right side
-            (t
-             (display-buffer-in-side-window
-              buffer '((side . right)
-                       (window-width . 0.5)
-                       (slot . 0)))))))))
+          (let ((window (split-window-right)))
+            (select-window window)
+            (set-window-buffer window buffer)
+            window))))
 
 
 ;; ---------- Corfu Setup ----------
@@ -422,5 +414,14 @@
 
 (add-hook 'lsp-mode-hook #'corfu-mode)
 
+;; ====================
+;; Move line up/down with Super + ↑ / ↓
+;; ====================
+(use-package move-text
+  :ensure t
+  :config
+  ;; Don't override smartparens' M-<up>/<down>
+  (global-set-key (kbd "s-<up>") 'move-text-up)
+  (global-set-key (kbd "s-<down>") 'move-text-down))
 
 ;;; kanishk-conf.el ends here
