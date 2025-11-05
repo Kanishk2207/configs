@@ -140,6 +140,37 @@
   (my/gui-setup (selected-frame)))
 
 
+;; ==========================
+;; Permanent white cursor
+;; ==========================
+(defvar my/cursor-color "white"
+  "The only cursor color allowed. Change this var to alter the color manually.")
+
+(defun my/lock-cursor-color (&rest _)
+  "Force the cursor color to stay `my/cursor-color`, ignoring theme changes."
+  (let ((current (frame-parameter nil 'cursor-color)))
+    (unless (string= current my/cursor-color)
+      (set-cursor-color my/cursor-color)
+      ;; Also override theme face
+      (custom-set-faces
+       `(cursor ((t (:background ,my/cursor-color))))))))
+
+;; Apply immediately
+(my/lock-cursor-color)
+
+;; Re-apply whenever a theme loads (themes love to reset cursor)
+(advice-add 'load-theme :after #'my/lock-cursor-color)
+
+;; Re-apply when new frames are created (daemon-safe)
+(add-hook 'after-make-frame-functions
+          (lambda (f)
+            (with-selected-frame f
+              (my/lock-cursor-color))))
+
+;; Re-apply if something else changes it (just in case)
+(run-with-timer 0 10 #'my/lock-cursor-color) ;; every 10 seconds, silently reassert
+
+
 ;; ====================
 ;; LSP Mode
 ;; ====================
