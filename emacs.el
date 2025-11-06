@@ -41,9 +41,11 @@
 ;; LSP UI
 (use-package lsp-ui
   :ensure t
-  :commands lsp-ui-mode
-  :hook (lsp-mode . lsp-ui-mode))
-
+  :custom
+  (lsp-ui-sideline-enable nil)
+  (lsp-ui-doc-enable nil)
+  :hook
+  (lsp-mode . lsp-ui-mode)) ;; lsp-ui-peek will still work
 
 ;; ====================
 ;; Whitespace Mode
@@ -188,8 +190,11 @@
 ;; LSP UI
 (use-package lsp-ui
   :ensure t
-  :commands lsp-ui-mode
-  :hook (lsp-mode . lsp-ui-mode))
+  :custom
+  (lsp-ui-sideline-enable nil)
+  (lsp-ui-doc-enable nil)
+  :hook
+  (lsp-mode . lsp-ui-mode)) ;; lsp-ui-peek will still work
 
 
 ;; ====================
@@ -439,11 +444,13 @@
         ("TAB" . corfu-next)
         ("S-TAB" . corfu-previous)))
 
+
 ;; ---------- LSP Integration ----------
 (with-eval-after-load 'lsp-mode
-  (setq lsp-completion-provider :none)) ;; Disable LSP’s minibuffer completions
+  (setq lsp-completion-provider :capf))
 
 (add-hook 'lsp-mode-hook #'corfu-mode)
+
 
 ;; ====================
 ;; Move line up/down with Super + ↑ / ↓
@@ -454,5 +461,46 @@
   ;; Don't override smartparens' M-<up>/<down>
   (global-set-key (kbd "s-<up>") 'move-text-up)
   (global-set-key (kbd "s-<down>") 'move-text-down))
+
+
+;; ============================
+;; Disable Company Completely
+;; ============================
+
+;; Turn off company-mode globally (Prelude enables it)
+(with-eval-after-load 'company
+  (global-company-mode -1))
+
+;; Prevent company from starting in any buffer
+(add-hook 'after-init-hook
+          (lambda ()
+            (company-mode -1)
+            (global-company-mode -1)))
+
+;; If company-box is installed, kill it too
+(with-eval-after-load 'company-box
+  (company-box-mode -1))
+
+;;; --- Disable anaconda-mode entirely ---
+
+;; Stop it from ever loading
+(use-package anaconda-mode
+  :disabled t)
+
+(use-package company-anaconda
+  :disabled t)
+
+;; Remove any hooks Prelude or other packages might have added
+(with-eval-after-load 'python
+  (remove-hook 'python-mode-hook 'anaconda-mode)
+  (remove-hook 'python-mode-hook 'anaconda-eldoc-mode))
+
+;; If anaconda-mode somehow loads anyway, kill its keymap
+(with-eval-after-load 'anaconda-mode
+  (setq anaconda-mode nil)
+  (setq anaconda-eldoc-mode nil)
+  (when (boundp 'anaconda-mode-map)
+    (setcdr anaconda-mode-map nil)))
+
 
 ;;; kanishk-conf.el ends here
