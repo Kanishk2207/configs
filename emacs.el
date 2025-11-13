@@ -1,6 +1,14 @@
 ;;; kanishk-conf.el --- Personal configuration
 
 ;; ====================
+;; enable MELPA
+;; ====================
+
+(require 'package)
+(add-to-list 'package-archives '("melpa" . "https://melpa.org/packages/") t)
+(package-initialize)
+
+;; ====================
 ;; GUI Setup (daemon-safe)
 ;; ====================
 (defun my/gui-setup (frame)
@@ -400,14 +408,12 @@
 ;; Magit window split direction
 ;; ====================
 (with-eval-after-load 'magit
-  ;; Always show Magit in a side-by-side (vertical) split on the right
-  (setq magit-display-buffer-function
-        (lambda (buffer)
-          (let ((window (split-window-right)))
-            (select-window window)
-            (set-window-buffer window buffer)
-            window))))
+  ;; Restore the classic Magit window behavior
+  (setq magit-display-buffer-function #'magit-display-buffer-traditional)
 
+  ;; Force vertical splits (side-by-side)
+  (setq split-height-threshold nil)
+  (setq split-width-threshold 0))
 
 ;; ---------- Corfu Setup ----------
 (use-package corfu
@@ -464,24 +470,47 @@
 
 
 ;; ============================
-;; Disable Company Completely
+;; Nuclear option: Disable Company completely
 ;; ============================
 
-;; Turn off company-mode globally (Prelude enables it)
+;; 1. Prevent company from ever loading
+(setq prelude-company nil)  ;; Tell Prelude not to use Company
+
+;; 2. Unload company if already loaded
+(when (featurep 'company)
+  (global-company-mode -1)
+  (unload-feature 'company t))
+
+;; 3. Prevent loading via autoload
 (with-eval-after-load 'company
   (global-company-mode -1))
 
-;; Prevent company from starting in any buffer
-(add-hook 'after-init-hook
-          (lambda ()
-            (company-mode -1)
-            (global-company-mode -1)))
+;; 4. Remove from all major mode hooks
+(defun my/kill-company-in-buffer ()
+  "Ensure company-mode is off in current buffer."
+  (when (bound-and-true-p company-mode)
+    (company-mode -1)))
 
-;; If company-box is installed, kill it too
-(with-eval-after-load 'company-box
-  (company-box-mode -1))
+(add-hook 'after-change-major-mode-hook #'my/kill-company-in-buffer)
 
-;;; --- Disable anaconda-mode entirely ---
+;; 5. Specifically for programming modes (where Prelude likes to enable it)
+(dolist (hook '(prog-mode-hook
+                python-mode-hook
+                emacs-lisp-mode-hook
+                go-mode-hook))
+  (add-hook hook (lambda () (company-mode -1)) 90))  ;; Run late to override Prelude
+
+;; 6. If somehow company gets enabled, immediately disable it
+(defun my/prevent-company-mode (orig-fun &optional arg &rest args)
+  "Prevent company-mode from being enabled."
+  (when (or (not arg) (<= arg 0))
+    (apply orig-fun arg args)))
+
+(advice-add 'company-mode :around #'my/prevent-company-mode)
+
+;; ============================
+;; Disable anaconda mode entirly
+;; ============================
 
 ;; Stop it from ever loading
 (use-package anaconda-mode
@@ -502,5 +531,22 @@
   (when (boundp 'anaconda-mode-map)
     (setcdr anaconda-mode-map nil)))
 
+;; ============================
+;; Auto detect python version
+;; ============================
+
+(use-package pyvenv
+  :ensure t
+  :config
+  (pyvenv-tracking-mode 1))
+
+
+(defun confirm-before-quit ()
+  "Ask for confirmation before quitting Emacs."
+  (interactive)
+  (when (yes-or-no-p "Really quit Emacs? ")
+    (save-buffers-kill-terminal)))
+
+(global-set-key (kbd "C-x C-c") #'confirm-before-quit)
 
 ;;; kanishk-conf.el ends here
