@@ -457,6 +457,13 @@
 
 (add-hook 'lsp-mode-hook #'corfu-mode)
 
+;; Better fuzzy matching for Corfu + LSP
+(use-package orderless
+  :ensure t
+  :custom
+  (completion-styles '(orderless))
+  (completion-category-defaults nil)
+  (completion-category-overrides '((lsp-capf (styles orderless)))))
 
 ;; ====================
 ;; Move line up/down with Super + ↑ / ↓
