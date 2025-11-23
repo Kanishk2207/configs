@@ -19,7 +19,10 @@
         (css-mode    . css-ts-mode)
         (c-mode      . c-ts-mode)
         (c++-mode    . c++-ts-mode)
-        (go-mode     . go-ts-mode)))
+        (go-mode     . go-ts-mode)
+        (rust-mode   . rust-ts-mode)))
+
+(setq treesit-font-lock-level 4)
 
 ;; ==========================
 ;; Visual tweaks: cursor + region
@@ -53,19 +56,6 @@
               (my/lock-cursor-color)
               (my/set-region-color))))
 
-;; ====================
-;; Doom Theme (daemon-safe)
-;; ====================
-(use-package doom-themes
-  :ensure t
-  :init
-  ;; Make sure themes are loaded after initialization to avoid partial face setup
-  (add-hook 'after-init-hook
-            (lambda ()
-              (load-theme 'doom-dark+ t)))
-  :config
-  (doom-themes-org-config)
-  (doom-themes-visual-bell-config))
 
 ;; ====================
 ;; GUI Setup (daemon-safe)
@@ -90,14 +80,16 @@
 (use-package lsp-mode
   :ensure t
   :init
-  (setq lsp-semantic-tokens-enable t)   ;; enable semantic tokens
+  ;; (setq lsp-semantic-tokens-enable t)   ;; enable semantic tokens
   :hook
   ((python-mode   . lsp)
    (python-ts-mode . lsp)
    (go-mode       . lsp)
    (go-ts-mode    . lsp)
    (js-mode       . lsp)
-   (js-ts-mode    . lsp))
+   (js-ts-mode    . lsp)
+   (rust-mode     . lsp)
+   (rust-ts-mode  . lsp))
   :commands lsp)
 
 ;; LSP UI
@@ -416,5 +408,56 @@
   (when (yes-or-no-p "Really quit Emacs? ")
     (save-buffers-kill-terminal)))
 (global-set-key (kbd "C-x C-c") #'confirm-before-quit)
+
+;; -------------------------
+;; Rust + rust-analyzer + tree-sitter
+;; -------------------------
+(use-package rust-ts-mode
+  :ensure nil   ;; built-in in Emacs 29+
+  :mode ("\\.rs\\'" . rust-ts-mode)
+  :hook
+  (rust-ts-mode . lsp)
+  (rust-ts-mode . lsp-inlay-hints-mode)
+  :config
+  ;; rust-analyzer formatting
+  (setq lsp-rust-analyzer-proc-macro-enable t)
+  (setq lsp-rust-analyzer-cargo-watch-command "check")
+  (setq lsp-rust-analyzer-check-on-save t)
+  (setq lsp-rust-analyzer-use-lld t)
+  (setq lsp-rust-analyzer-diagnostics-enable t)
+  (setq lsp-rust-analyzer-display-chaining-hints t)
+  (setq lsp-rust-analyzer-display-parameter-hints t)
+  (setq lsp-inlay-hint-enable t))
+
+(defun lsp-format-buffer-on-save ()
+  "Add auto-formatting on save for buffers using lsp-mode."
+  (add-hook 'before-save-hook #'lsp-format-buffer nil t))
+
+;; --- Extra Rust highlighting: semantic tokens + Doom theme enhancements ---
+
+(with-eval-after-load 'lsp-mode
+  ;; Ensure semantic tokens specifically for rust-ts-mode
+  (add-hook 'rust-ts-mode-hook #'lsp-semantic-tokens-mode))
+
+;; Doom treesitter visual enhancements
+(setq doom-themes-treesitter-colored-indent-levels t)
+(setq doom-themes-enable-bold t
+      doom-themes-enable-italic t)
+
+
+;; ====================
+;; Doom Theme (daemon-safe)
+;; ====================
+(use-package doom-themes
+  :ensure t
+  :init
+  ;; Make sure themes are loaded after initialization to avoid partial face setup
+  (add-hook 'after-init-hook
+            (lambda ()
+              (load-theme 'doom-dark+ t)))
+  :config
+  (doom-themes-org-config)
+  (doom-themes-visual-bell-config))
+
 
 ;;; kanishk-conf.el ends here
