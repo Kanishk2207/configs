@@ -180,20 +180,73 @@
   (define-key python-mode-map (kbd "M-u") #'python-nav-backward-up-list) ;; up to parent
   (define-key python-mode-map (kbd "M-d") #'python-nav-forward-statement)) ;; down into child
 
-;; ====================
-;; Git Diff Fringe
-;; ====================
-(global-diff-hl-mode +1)
-(add-hook 'magit-post-refresh-hook 'diff-hl-magit-post-refresh)
-(add-hook 'dired-mode-hook 'diff-hl-dired-mode)
+;; -----------------------------------------
+;; Python LSP Setup (Pyright + Ruff-LSP)
+;; -----------------------------------------
 
-;; Optional keybindings for navigating hunks
-(global-set-key (kbd "C-x v n") 'diff-hl-next-hunk)
-(global-set-key (kbd "C-x v p") 'diff-hl-previous-hunk)
-(global-set-key (kbd "C-x v r") 'diff-hl-revert-hunk)
+;; Format + organize imports on save
+(defun my/python-lsp-format-on-save ()
+  "Format buffer using LSP and organize imports using Pyright."
+  (when (derived-mode-p 'python-mode 'python-ts-mode)
+    (lsp-format-buffer)
+    (lsp-pyright-organize-imports)))
 
-(setq diff-hl-fringe-face-function
-      'diff-hl-fringe-face-from-type)
+(defun my/python-lsp-setup ()
+  "Enable auto-format and auto-import on save for Python."
+  (add-hook 'before-save-hook #'my/python-lsp-format-on-save nil t))
+
+
+;; Detect virtualenv Python
+(defun my/lsp-pyright-locate-python-from-pyvenv ()
+  "Return Python executable from active pyvenv virtualenv."
+  (when (and (boundp 'pyvenv-virtual-env) pyvenv-virtual-env)
+    (let ((python (expand-file-name "bin/python" pyvenv-virtual-env)))
+      (when (file-executable-p python) python))))
+
+
+;; -----------------------------------------
+;; Add python-ts-mode support to LSP clients
+;; -----------------------------------------
+(with-eval-after-load 'lsp-mode
+  (add-to-list 'lsp-language-id-configuration '(python-ts-mode . "python")))
+
+
+;; -----------------------------------------
+;; Ruff LSP (formatter & lint server)
+;; -----------------------------------------
+(with-eval-after-load 'lsp-ruff
+  (setq lsp-ruff-major-modes '(python-mode python-ts-mode)))
+
+
+;; -----------------------------------------
+;; Pyright (type checking + imports)
+;; -----------------------------------------
+(use-package lsp-pyright
+  :ensure t
+  :after lsp-mode
+  :init
+  (add-to-list 'lsp-language-id-configuration '(python-ts-mode . "python"))
+  :custom
+  (lsp-pyright-modes '(python-mode python-ts-mode))
+  (lsp-pyright-type-checking-mode "basic")
+  (lsp-pyright-auto-import-completions t)
+  (lsp-pyright-use-library-code-for-types t)
+  (lsp-pyright-auto-detect-venv t)
+  :hook ((python-mode . my/python-lsp-setup)
+         (python-ts-mode . my/python-lsp-setup))
+  :config
+  (with-eval-after-load 'pyvenv
+    (add-to-list 'lsp-pyright-python-search-functions
+                 #'my/lsp-pyright-locate-python-from-pyvenv)))
+
+
+;; -----------------------------------------
+;; Ruff linting (Flymake)
+;; -----------------------------------------
+(use-package flymake-ruff
+  :ensure t
+  :hook ((python-mode . flymake-ruff-load)
+         (python-ts-mode . flymake-ruff-load)))
 
 ;; ====================
 ;; Ediff
