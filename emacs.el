@@ -173,23 +173,23 @@
 ;; ====================
 (with-eval-after-load 'python
   ;; Jump between blocks at same indentation
-  (define-key python-mode-map (kbd "M-n") #'python-nav-forward-block)
-  (define-key python-mode-map (kbd "M-p") #'python-nav-backward-block)
+  (define-key python-ts-mode-map (kbd "M-n") #'python-nav-forward-block)
+  (define-key python-ts-mode-map (kbd "M-p") #'python-nav-backward-block)
 
   ;; Jump up/down indentation levels
-  (define-key python-mode-map (kbd "M-u") #'python-nav-backward-up-list) ;; up to parent
-  (define-key python-mode-map (kbd "M-d") #'python-nav-forward-statement)) ;; down into child
+  (define-key python-ts-mode-map (kbd "M-u") #'python-nav-backward-up-list) ;; up to parent
+  (define-key python-ts-mode-map (kbd "M-d") #'python-nav-forward-statement)) ;; down into child
 
 ;; -----------------------------------------
 ;; Python LSP Setup (Pyright + Ruff-LSP)
 ;; -----------------------------------------
 
-;; Format + organize imports on save
+;; Format on save
 (defun my/python-lsp-format-on-save ()
   "Format buffer using LSP and organize imports using Pyright."
   (when (derived-mode-p 'python-mode 'python-ts-mode)
-    (lsp-format-buffer)
-    (lsp-pyright-organize-imports)))
+    (lsp-format-buffer)))
+
 
 (defun my/python-lsp-setup ()
   "Enable auto-format and auto-import on save for Python."
@@ -217,6 +217,32 @@
 (with-eval-after-load 'lsp-ruff
   (setq lsp-ruff-major-modes '(python-mode python-ts-mode)))
 
+
+(defvar my/ruff-allowed-kinds
+  '("source.fixAll.ruff"
+    "source.organizeImports.ruff")
+  "List of Ruff code action kinds that should auto-run on save.")
+
+;; fix auto fixable issues and organises imports
+(defun my/ruff-apply-actions ()
+  "Apply only approved Ruff code actions on save."
+  (when (and (bound-and-true-p lsp-mode)
+             (lsp-feature? "textDocument/codeAction"))
+    (let ((actions (lsp-request
+                    "textDocument/codeAction"
+                    (lsp--text-document-code-action-params))))
+      (dolist (action actions)
+        (let ((kind (gethash "kind" action)))
+          (when (member kind my/ruff-allowed-kinds)
+            (lsp-execute-code-action action)))))))
+
+(add-hook 'python-mode-hook
+          (lambda ()
+            (add-hook 'before-save-hook #'my/ruff-apply-actions nil t)))
+
+(add-hook 'python-ts-mode-hook
+          (lambda ()
+            (add-hook 'before-save-hook #'my/ruff-apply-actions nil t)))
 
 ;; -----------------------------------------
 ;; Pyright (type checking + imports)
