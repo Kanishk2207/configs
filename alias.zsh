@@ -1,6 +1,7 @@
 alias aev='source .venv/bin/activate'
 alias e='emacsclient -t'
-alias ec='emacsclient -c'
+alias ec='nohup emacsclient -c >/dev/null 2>&1 &'
 alias vim='emacsclient -t'
 alias vi='emacsclient -t'
 alias kill-emacs='emacsclient -e "(kill-emacs)"'
+alias kubectl='kubectl --kubeconfig=$HOME/.kube/config'
