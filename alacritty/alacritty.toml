@@ -1,3 +1,9 @@
+[general]
+import = ["~/.config/alacritty/themes/alacritty/dracula.toml"]
+
+[colors.primary]
+background = "#0F0F0F"
+
 [window]
 option_as_alt = "Both"
 
