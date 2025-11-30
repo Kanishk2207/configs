@@ -169,7 +169,7 @@
                 (local-set-key (kbd "M-?") #'lsp-ui-peek-find-references)))))
 
 ;; ====================
-;; Python Enhancements
+;; Python Enhancements TODO: add venv restart and along with lsp restart on project switch
 ;; ====================
 (with-eval-after-load 'python
   ;; Jump between blocks at same indentation
@@ -184,6 +184,13 @@
 ;; Python LSP Setup (Pyright + Ruff-LSP)
 ;; -----------------------------------------
 
+;; Detect virtualenv Python
+(defun my/lsp-pyright-locate-python-from-pyvenv ()
+  "Return Python executable from active pyvenv virtualenv."
+  (when (and (boundp 'pyvenv-virtual-env) pyvenv-virtual-env)
+    (let ((python (expand-file-name "bin/python" pyvenv-virtual-env)))
+      (when (file-executable-p python) python))))
+
 ;; Format on save
 (defun my/python-lsp-format-on-save ()
   "Format buffer using LSP and organize imports using Pyright."
@@ -194,14 +201,6 @@
 (defun my/python-lsp-setup ()
   "Enable auto-format and auto-import on save for Python."
   (add-hook 'before-save-hook #'my/python-lsp-format-on-save nil t))
-
-
-;; Detect virtualenv Python
-(defun my/lsp-pyright-locate-python-from-pyvenv ()
-  "Return Python executable from active pyvenv virtualenv."
-  (when (and (boundp 'pyvenv-virtual-env) pyvenv-virtual-env)
-    (let ((python (expand-file-name "bin/python" pyvenv-virtual-env)))
-      (when (file-executable-p python) python))))
 
 
 ;; -----------------------------------------
@@ -223,6 +222,7 @@
     "source.organizeImports.ruff")
   "List of Ruff code action kinds that should auto-run on save.")
 
+
 ;; fix auto fixable issues and organises imports
 (defun my/ruff-apply-actions ()
   "Apply only approved Ruff code actions on save."
@@ -236,13 +236,25 @@
           (when (member kind my/ruff-allowed-kinds)
             (lsp-execute-code-action action)))))))
 
+
 (add-hook 'python-mode-hook
           (lambda ()
             (add-hook 'before-save-hook #'my/ruff-apply-actions nil t)))
 
+
 (add-hook 'python-ts-mode-hook
           (lambda ()
             (add-hook 'before-save-hook #'my/ruff-apply-actions nil t)))
+
+
+;; -----------------------------------------
+;; Ruff linting (Flymake)
+;; -----------------------------------------
+(use-package flymake-ruff
+  :ensure t
+  :hook ((python-mode . flymake-ruff-load)
+         (python-ts-mode . flymake-ruff-load)))
+
 
 ;; -----------------------------------------
 ;; Pyright (type checking + imports)
@@ -264,15 +276,6 @@
   (with-eval-after-load 'pyvenv
     (add-to-list 'lsp-pyright-python-search-functions
                  #'my/lsp-pyright-locate-python-from-pyvenv)))
-
-
-;; -----------------------------------------
-;; Ruff linting (Flymake)
-;; -----------------------------------------
-(use-package flymake-ruff
-  :ensure t
-  :hook ((python-mode . flymake-ruff-load)
-         (python-ts-mode . flymake-ruff-load)))
 
 ;; ====================
 ;; Ediff
@@ -492,21 +495,18 @@
 ;; Rust + rust-analyzer + tree-sitter
 ;; -------------------------
 (use-package rust-ts-mode
-  :ensure nil   ;; built-in in Emacs 29+
   :mode ("\\.rs\\'" . rust-ts-mode)
   :hook
   (rust-ts-mode . lsp)
   (rust-ts-mode . lsp-inlay-hints-mode)
+  (rust-ts-mode . lsp-format-buffer-on-save)
   :config
-  ;; rust-analyzer formatting
-  (setq lsp-rust-analyzer-proc-macro-enable t)
   (setq lsp-rust-analyzer-cargo-watch-command "check")
+  (setq lsp-rust-analyzer-proc-macro-enable t)
   (setq lsp-rust-analyzer-check-on-save t)
-  (setq lsp-rust-analyzer-use-lld t)
-  (setq lsp-rust-analyzer-diagnostics-enable t)
-  (setq lsp-rust-analyzer-display-chaining-hints t)
-  (setq lsp-rust-analyzer-display-parameter-hints t)
-  (setq lsp-inlay-hint-enable t))
+  (setq lsp-rust-analyzer-cargo-cfgs [])
+  ;; modern inlay hints
+  (setq lsp-rust-analyzer-server-display-inlay-hints t))
 
 (defun lsp-format-buffer-on-save ()
   "Add auto-formatting on save for buffers using lsp-mode."
