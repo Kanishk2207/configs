@@ -1,4 +1,4 @@
-;;; kanishk-conf.el --- Personal configuration
+;;; kanishk-conf.el --- Personal configuration  -*- lexical-binding: t; -*-
 
 ;; ====================
 ;; Package / MELPA
