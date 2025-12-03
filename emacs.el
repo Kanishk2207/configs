@@ -10,6 +10,7 @@
 (eval-when-compile
   (require 'use-package))
 
+
 ;; ====================
 ;; Emacs 30: use tree-sitter modes
 ;; ====================
@@ -63,8 +64,20 @@
 ;; Keybindings (Xref-based navigation)
 ;; ====================
 
+
+(use-package embark
+  :ensure t)
+
 (use-package consult
   :ensure t)
+
+(use-package embark-consult
+  :ensure t
+  :after (embark consult))
+
+(use-package consult-eglot-embark
+  :ensure t
+  :after (consult embark eglot))
 
 (setq xref-show-xrefs-function #'consult-xref
       xref-show-definitions-function #'consult-xref)
@@ -79,7 +92,6 @@
 
 ;; Code actions (Ruff fixes, Pyright suggestions, Rust actions)
 (global-set-key (kbd "C-c C-a") #'eglot-code-actions)
-
 
 ;; ====================
 ;; Python Setup (Pyright + Ruff + formatting)
@@ -271,6 +283,7 @@
 (with-eval-after-load 'projectile
   (setq projectile-switch-project-action #'projectile-dired))
 
+
 ;; ====================
 ;; Python Enhancements TODO: add venv restart and along with lsp restart on project switch
 ;; ====================
@@ -409,7 +422,7 @@
  ;; Make sure themes are loaded after initialization to avoid partial face setup
  (add-hook 'after-init-hook
            (lambda ()
-             (load-theme 'doom-dark+ t)))
+             (load-theme 'doom-one t)))
  :config
  (doom-themes-org-config)
  (doom-themes-visual-bell-config))
