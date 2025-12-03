@@ -1,4 +1,4 @@
-;;; kanishk-conf.el --- Personal configuration  -*- lexical-binding: t; -*-
+;;; kanishk-conf.el --- Personal configuration
 
 ;; ====================
 ;; Package / MELPA
@@ -23,6 +23,169 @@
         (rust-mode   . rust-ts-mode)))
 
 (setq treesit-font-lock-level 4)
+
+
+;; ====================
+;; Eglot (LSP Client)
+;; ====================
+
+(use-package eglot
+  :ensure t
+  :hook ((python-mode python-ts-mode
+          go-mode go-ts-mode
+          js-mode js-ts-mode
+          rust-mode rust-ts-mode)
+         . eglot-ensure)
+  :config
+  ;; Slightly quieter Eglot, shuts down cleanly
+  (setq eglot-autoshutdown t
+        eglot-events-buffer-size 0)
+
+  ;; Inlay hints for languages that support them
+  (add-hook 'eglot-managed-mode-hook #'eglot-inlay-hints-mode)
+
+  ;; rust-analyzer manually registered for rust-ts-mode
+  (add-to-list 'eglot-server-programs
+               '(rust-ts-mode . ("rust-analyzer"))))
+
+(with-eval-after-load 'eglot
+  (set-face-attribute 'eglot-inlay-hint-face nil
+                      :foreground "#88c0d0"
+                      :background "#3b4252"
+                      :box '(:line-width -1 :color "#4c566a")
+                      :height 0.9)
+  (set-face-attribute 'eglot-diagnostic-tag-unnecessary-face nil
+                      :underline '(:style wave :color "cyan")
+                      :foreground "cyan"))
+
+
+;; ====================
+;; Keybindings (Xref-based navigation)
+;; ====================
+
+(use-package consult
+  :ensure t)
+
+(setq xref-show-xrefs-function #'consult-xref
+      xref-show-definitions-function #'consult-xref)
+
+;; Disable smartparens stealing M-?
+(with-eval-after-load 'smartparens
+  (define-key smartparens-mode-map (kbd "M-?") nil))
+
+(global-set-key (kbd "M-.") #'xref-find-definitions)
+(global-set-key (kbd "M-?") #'xref-find-references)
+(global-set-key (kbd "M-,") #'xref-go-back)
+
+;; Code actions (Ruff fixes, Pyright suggestions, Rust actions)
+(global-set-key (kbd "C-c C-a") #'eglot-code-actions)
+
+
+;; ====================
+;; Python Setup (Pyright + Ruff + formatting)
+;; ====================
+
+;; Auto-detect virtualenv
+(use-package pyvenv
+  :ensure t
+  :config
+  (pyvenv-tracking-mode 1))
+
+;; ---- Ruff Autofix on save ----
+(defun my/ruff-autofix ()
+  "Apply Ruff LSP auto-fixes using Eglot."
+  (when (and (eglot-managed-p)
+             (eglot-code-action-organize-imports-supported))
+    (eglot-code-actions
+     (point-min)
+     (point-max)
+     "source.fixAll.ruff")))
+
+(add-hook 'python-mode-hook
+          (lambda ()
+            (add-hook 'before-save-hook #'my/ruff-autofix nil t)))
+
+(add-hook 'python-ts-mode-hook
+          (lambda ()
+            (add-hook 'before-save-hook #'my/ruff-autofix nil t)))
+
+
+;; ---- Python Formatting via Pyright ----
+(defun my/python-format-on-save ()
+  "Format Python buffer using Eglot (Pyright)."
+  (when (eglot-managed-p)
+    (eglot-format)))
+
+(add-hook 'python-mode-hook
+          (lambda ()
+            (add-hook 'before-save-hook #'my/python-format-on-save nil t)))
+
+(add-hook 'python-ts-mode-hook
+          (lambda ()
+            (add-hook 'before-save-hook #'my/python-format-on-save nil t)))
+
+
+;; ---- Ruff Flymake linting ----
+(use-package flymake-ruff
+  :ensure t
+  :hook ((python-mode . flymake-ruff-load)
+         (python-ts-mode . flymake-ruff-load)))
+
+
+;; ====================
+;; Rust Setup
+;; ====================
+
+(add-hook 'rust-ts-mode-hook
+          (lambda ()
+            (flycheck-mode -1)
+            (add-hook 'before-save-hook #'eglot-format nil t)))
+
+
+;; ====================
+;; Corfu Setup
+;; ====================
+
+(use-package corfu
+  :ensure t
+  :init
+  (global-corfu-mode)
+  (corfu-popupinfo-mode)
+  :custom
+  (corfu-cycle t)
+  (corfu-auto t)
+  (corfu-auto-prefix 2)
+  (corfu-preselect 'first)
+  (corfu-scroll-margin 4)
+  (corfu-quit-at-boundary 'separator)
+  (corfu-quit-no-match 'separator)
+  (corfu-preview-current nil)
+  (corfu-min-width 20)
+  (corfu-max-width 80)
+  (corfu-count 14)
+  :bind
+  (:map corfu-map
+        ("C-n" . corfu-next)
+        ("C-p" . corfu-previous)
+        ("<down>" . corfu-next)
+        ("<up>" . corfu-previous)
+        ("M-RET" . corfu-insert)
+        ("RET" . corfu-insert)
+        ("TAB" . corfu-next)
+        ("S-TAB" . corfu-previous)))
+
+(add-hook 'eglot-managed-mode-hook #'corfu-mode)
+
+
+;; Better fuzzy matching
+(use-package orderless
+  :ensure t
+  :custom
+  (completion-styles '(orderless))
+  (completion-category-defaults nil)
+  (completion-category-overrides
+   '((eglot (styles orderless))
+     (lsp-capf (styles orderless)))))
 
 ;; ==========================
 ;; Visual tweaks: cursor + region
@@ -75,44 +238,6 @@
   (my/gui-setup (selected-frame)))
 
 ;; ====================
-;; LSP Mode
-;; ====================
-(use-package lsp-mode
-  :ensure t
-  :init
-  ;; (setq lsp-semantic-tokens-enable t)   ;; enable semantic tokens
-  :hook
-  ((python-mode   . lsp)
-   (python-ts-mode . lsp)
-   (go-mode       . lsp)
-   (go-ts-mode    . lsp)
-   (js-mode       . lsp)
-   (js-ts-mode    . lsp)
-   (rust-mode     . lsp)
-   (rust-ts-mode  . lsp))
-  :commands lsp)
-
-;; LSP UI
-(use-package lsp-ui
-  :ensure t
-  :custom
-  (lsp-ui-sideline-enable nil)
-  (lsp-ui-doc-enable nil)
-  :hook
-  (lsp-mode . lsp-ui-mode))
-
-;; Refresh semantic tokens after theme changes for all LSP buffers
-(with-eval-after-load 'lsp-mode
-  (defun my/lsp-refresh-semantic-tokens-after-theme (&rest _)
-    "Refresh LSP semantic tokens in all buffers after a theme change."
-    (dolist (buf (buffer-list))
-      (with-current-buffer buf
-        (when (bound-and-true-p lsp-mode)
-          (ignore-errors
-            (lsp-semantic-tokens-refresh))))))
-  (advice-add 'load-theme :after #'my/lsp-refresh-semantic-tokens-after-theme))
-
-;; ====================
 ;; Whitespace Mode
 ;; ====================
 (setq whitespace-style
@@ -147,28 +272,6 @@
   (setq projectile-switch-project-action #'projectile-dired))
 
 ;; ====================
-;; Keybindings for LSP navigation
-;; ====================
-(with-eval-after-load 'lsp-mode
-  (with-eval-after-load 'lsp-ui
-
-    ;; 1. Unbind M-? from minor modes that override it
-    (with-eval-after-load 'smartparens
-      (define-key smartparens-mode-map (kbd "M-?") nil))
-    (with-eval-after-load 'anaconda-mode
-      (define-key anaconda-mode-map (kbd "M-?") nil))
-
-    ;; 2. Set up keybindings for LSP navigation
-    (global-set-key (kbd "M-.") #'lsp-find-definition)
-    (global-set-key (kbd "M-?") #'lsp-ui-peek-find-references)
-    (global-set-key (kbd "M-,") #'xref-pop-marker-stack)
-
-    ;; 3. Optional: make M-? local in programming buffers
-    (add-hook 'prog-mode-hook
-              (lambda ()
-                (local-set-key (kbd "M-?") #'lsp-ui-peek-find-references)))))
-
-;; ====================
 ;; Python Enhancements TODO: add venv restart and along with lsp restart on project switch
 ;; ====================
 (with-eval-after-load 'python
@@ -180,102 +283,6 @@
   (define-key python-ts-mode-map (kbd "M-u") #'python-nav-backward-up-list) ;; up to parent
   (define-key python-ts-mode-map (kbd "M-d") #'python-nav-forward-statement)) ;; down into child
 
-;; -----------------------------------------
-;; Python LSP Setup (Pyright + Ruff-LSP)
-;; -----------------------------------------
-
-;; Detect virtualenv Python
-(defun my/lsp-pyright-locate-python-from-pyvenv ()
-  "Return Python executable from active pyvenv virtualenv."
-  (when (and (boundp 'pyvenv-virtual-env) pyvenv-virtual-env)
-    (let ((python (expand-file-name "bin/python" pyvenv-virtual-env)))
-      (when (file-executable-p python) python))))
-
-;; Format on save
-(defun my/python-lsp-format-on-save ()
-  "Format buffer using LSP and organize imports using Pyright."
-  (when (derived-mode-p 'python-mode 'python-ts-mode)
-    (lsp-format-buffer)))
-
-
-(defun my/python-lsp-setup ()
-  "Enable auto-format and auto-import on save for Python."
-  (add-hook 'before-save-hook #'my/python-lsp-format-on-save nil t))
-
-
-;; -----------------------------------------
-;; Add python-ts-mode support to LSP clients
-;; -----------------------------------------
-(with-eval-after-load 'lsp-mode
-  (add-to-list 'lsp-language-id-configuration '(python-ts-mode . "python")))
-
-
-;; -----------------------------------------
-;; Ruff LSP (formatter & lint server)
-;; -----------------------------------------
-(with-eval-after-load 'lsp-ruff
-  (setq lsp-ruff-major-modes '(python-mode python-ts-mode)))
-
-
-(defvar my/ruff-allowed-kinds
-  '("source.fixAll.ruff"
-    "source.organizeImports.ruff")
-  "List of Ruff code action kinds that should auto-run on save.")
-
-
-;; fix auto fixable issues and organises imports
-(defun my/ruff-apply-actions ()
-  "Apply only approved Ruff code actions on save."
-  (when (and (bound-and-true-p lsp-mode)
-             (lsp-feature? "textDocument/codeAction"))
-    (let ((actions (lsp-request
-                    "textDocument/codeAction"
-                    (lsp--text-document-code-action-params))))
-      (dolist (action actions)
-        (let ((kind (gethash "kind" action)))
-          (when (member kind my/ruff-allowed-kinds)
-            (lsp-execute-code-action action)))))))
-
-
-(add-hook 'python-mode-hook
-          (lambda ()
-            (add-hook 'before-save-hook #'my/ruff-apply-actions nil t)))
-
-
-(add-hook 'python-ts-mode-hook
-          (lambda ()
-            (add-hook 'before-save-hook #'my/ruff-apply-actions nil t)))
-
-
-;; -----------------------------------------
-;; Ruff linting (Flymake)
-;; -----------------------------------------
-(use-package flymake-ruff
-  :ensure t
-  :hook ((python-mode . flymake-ruff-load)
-         (python-ts-mode . flymake-ruff-load)))
-
-
-;; -----------------------------------------
-;; Pyright (type checking + imports)
-;; -----------------------------------------
-(use-package lsp-pyright
-  :ensure t
-  :after lsp-mode
-  :init
-  (add-to-list 'lsp-language-id-configuration '(python-ts-mode . "python"))
-  :custom
-  (lsp-pyright-modes '(python-mode python-ts-mode))
-  (lsp-pyright-type-checking-mode "basic")
-  (lsp-pyright-auto-import-completions t)
-  (lsp-pyright-use-library-code-for-types t)
-  (lsp-pyright-auto-detect-venv t)
-  :hook ((python-mode . my/python-lsp-setup)
-         (python-ts-mode . my/python-lsp-setup))
-  :config
-  (with-eval-after-load 'pyvenv
-    (add-to-list 'lsp-pyright-python-search-functions
-                 #'my/lsp-pyright-locate-python-from-pyvenv)))
 
 ;; ====================
 ;; Ediff
@@ -374,48 +381,6 @@
   (setq split-height-threshold nil)
   (setq split-width-threshold 0))
 
-;; ---------- Corfu Setup ----------
-(use-package corfu
-  :ensure t
-  :init
-  (global-corfu-mode)
-  (corfu-popupinfo-mode)
-  :custom
-  (corfu-cycle t)
-  (corfu-auto t)
-  (corfu-auto-prefix 2)
-  (corfu-preselect 'first)
-  (corfu-scroll-margin 4)
-  (corfu-quit-at-boundary 'separator)
-  (corfu-quit-no-match 'separator)
-  (corfu-preview-current nil)
-  (corfu-min-width 20)
-  (corfu-max-width 80)
-  (corfu-count 14)
-  :bind
-  (:map corfu-map
-        ("C-n" . corfu-next)
-        ("C-p" . corfu-previous)
-        ("<down>" . corfu-next)
-        ("<up>" . corfu-previous)
-        ("M-RET" . corfu-insert)
-        ("RET" . corfu-insert)
-        ("TAB" . corfu-next)
-        ("S-TAB" . corfu-previous)))
-
-;; ---------- LSP Integration with Corfu ----------
-(with-eval-after-load 'lsp-mode
-  (setq lsp-completion-provider :capf))
-(add-hook 'lsp-mode-hook #'corfu-mode)
-
-;; Better fuzzy matching for Corfu + LSP
-(use-package orderless
-  :ensure t
-  :custom
-  (completion-styles '(orderless))
-  (completion-category-defaults nil)
-  (completion-category-overrides '((lsp-capf (styles orderless)))))
-
 ;; ====================
 ;; Move line up/down with Super + ↑ / ↓
 ;; ====================
@@ -424,62 +389,6 @@
   :config
   (global-set-key (kbd "s-<up>") 'move-text-up)
   (global-set-key (kbd "s-<down>") 'move-text-down))
-
-;; ============================
-;; Nuclear option: Disable Company completely
-;; ============================
-(setq prelude-company nil)
-
-(when (featurep 'company)
-  (global-company-mode -1)
-  (unload-feature 'company t))
-
-(with-eval-after-load 'company
-  (global-company-mode -1))
-
-(defun my/kill-company-in-buffer ()
-  "Ensure company-mode is off in current buffer."
-  (when (bound-and-true-p company-mode)
-    (company-mode -1)))
-(add-hook 'after-change-major-mode-hook #'my/kill-company-in-buffer)
-
-(dolist (hook '(prog-mode-hook
-                python-mode-hook
-                emacs-lisp-mode-hook
-                go-mode-hook))
-  (add-hook hook (lambda () (company-mode -1)) 90))
-
-(defun my/prevent-company-mode (orig-fun &optional arg &rest args)
-  "Prevent company-mode from being enabled."
-  (when (or (not arg) (<= arg 0))
-    (apply orig-fun arg args)))
-(advice-add 'company-mode :around #'my/prevent-company-mode)
-
-;; ============================
-;; Disable anaconda mode entirely
-;; ============================
-(use-package anaconda-mode
-  :disabled t)
-(use-package company-anaconda
-  :disabled t)
-
-(with-eval-after-load 'python
-  (remove-hook 'python-mode-hook 'anaconda-mode)
-  (remove-hook 'python-mode-hook 'anaconda-eldoc-mode))
-
-(with-eval-after-load 'anaconda-mode
-  (setq anaconda-mode nil)
-  (setq anaconda-eldoc-mode nil)
-  (when (boundp 'anaconda-mode-map)
-    (setcdr anaconda-mode-map nil)))
-
-;; ============================
-;; Auto detect python version
-;; ============================
-(use-package pyvenv
-  :ensure t
-  :config
-  (pyvenv-tracking-mode 1))
 
 ;; ============================
 ;; Confirm before quitting
@@ -491,52 +400,23 @@
     (save-buffers-kill-terminal)))
 (global-set-key (kbd "C-x C-c") #'confirm-before-quit)
 
-;; -------------------------
-;; Rust + rust-analyzer + tree-sitter
-;; -------------------------
-(use-package rust-ts-mode
-  :mode ("\\.rs\\'" . rust-ts-mode)
-  :hook
-  (rust-ts-mode . lsp)
-  (rust-ts-mode . lsp-inlay-hints-mode)
-  (rust-ts-mode . lsp-format-buffer-on-save)
-  :config
-  (setq lsp-rust-analyzer-cargo-watch-command "check")
-  (setq lsp-rust-analyzer-proc-macro-enable t)
-  (setq lsp-rust-analyzer-check-on-save t)
-  (setq lsp-rust-analyzer-cargo-cfgs [])
-  ;; modern inlay hints
-  (setq lsp-rust-analyzer-server-display-inlay-hints t))
-
-(defun lsp-format-buffer-on-save ()
-  "Add auto-formatting on save for buffers using lsp-mode."
-  (add-hook 'before-save-hook #'lsp-format-buffer nil t))
-
-;; --- Extra Rust highlighting: semantic tokens + Doom theme enhancements ---
-
-(with-eval-after-load 'lsp-mode
-  ;; Ensure semantic tokens specifically for rust-ts-mode
-  (add-hook 'rust-ts-mode-hook #'lsp-semantic-tokens-mode))
+;; ====================
+;; Doom Theme (daemon-safe)
+;; ====================
+(use-package doom-themes
+ :ensure t
+ :init
+ ;; Make sure themes are loaded after initialization to avoid partial face setup
+ (add-hook 'after-init-hook
+           (lambda ()
+             (load-theme 'doom-dark+ t)))
+ :config
+ (doom-themes-org-config)
+ (doom-themes-visual-bell-config))
 
 ;; Doom treesitter visual enhancements
 (setq doom-themes-treesitter-colored-indent-levels t)
 (setq doom-themes-enable-bold t
       doom-themes-enable-italic t)
-
-
-;; ====================
-;; Doom Theme (daemon-safe)
-;; ====================
-(use-package doom-themes
-  :ensure t
-  :init
-  ;; Make sure themes are loaded after initialization to avoid partial face setup
-  (add-hook 'after-init-hook
-            (lambda ()
-              (load-theme 'doom-dark+ t)))
-  :config
-  (doom-themes-org-config)
-  (doom-themes-visual-bell-config))
-
 
 ;;; kanishk-conf.el ends here
