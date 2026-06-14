@@ -3,9 +3,10 @@
 ;; ====================
 ;; Package / MELPA
 ;; ====================
-(require 'package)
-(add-to-list 'package-archives '("melpa" . "https://melpa.org/packages/") t)
-(package-initialize)
+(setq package-archives
+      '(("gnu" . "https://elpa.gnu.org/packages/")
+        ("melpa" . "https://melpa.org/packages/")
+        ("nongnu" . "https://elpa.nongnu.org/nongnu/")))
 
 (eval-when-compile
   (require 'use-package))
@@ -16,11 +17,13 @@
 (setq major-mode-remap-alist
       '((python-mode . python-ts-mode)
         (js-mode     . js-ts-mode)
+        (js2-mode    . js-ts-mode)
         (css-mode    . css-ts-mode)
         (c-mode      . c-ts-mode)
         (c++-mode    . c++-ts-mode)
         (go-mode     . go-ts-mode)
-        (rust-mode   . rust-ts-mode)))
+        (rust-mode   . rust-ts-mode)
+        (elixir-mode . elixir-ts-mode)))
 
 (setq treesit-font-lock-level 4)
 
@@ -58,6 +61,16 @@
 
 
 ;; ====================
+;; Dired mode settings
+;; ====================
+(setq insert-directory-program "gls")
+
+(use-package dired-quick-sort
+  :ensure t
+  :config
+  (dired-quick-sort-setup))
+
+;; ====================
 ;; GUI Setup (daemon-safe)
 ;; ====================
 (defun my/gui-setup (frame)
@@ -80,16 +93,20 @@
 (use-package lsp-mode
   :ensure t
   :init
+  ;; Corfu + CAPF setup (avoid company-mode autoconfig warnings).
+  (setq lsp-completion-provider :capf)
+  ;; Silence snippet warning when yasnippet isn't installed.
+  (setq lsp-enable-snippet nil)
   ;; (setq lsp-semantic-tokens-enable t)   ;; enable semantic tokens
   :hook
-  ((python-mode   . lsp)
+  ((python-mode    . lsp)
    (python-ts-mode . lsp)
-   (go-mode       . lsp)
-   (go-ts-mode    . lsp)
-   (js-mode       . lsp)
-   (js-ts-mode    . lsp)
-   (rust-mode     . lsp)
-   (rust-ts-mode  . lsp))
+   (go-mode        . lsp)
+   (go-ts-mode     . lsp)
+   (js-mode        . lsp)
+   (js-ts-mode     . lsp)
+   (rust-mode      . lsp)
+   (rust-ts-mode   . lsp))
   :commands lsp)
 
 ;; LSP UI
@@ -404,8 +421,6 @@
         ("S-TAB" . corfu-previous)))
 
 ;; ---------- LSP Integration with Corfu ----------
-(with-eval-after-load 'lsp-mode
-  (setq lsp-completion-provider :capf))
 (add-hook 'lsp-mode-hook #'corfu-mode)
 
 ;; Better fuzzy matching for Corfu + LSP
@@ -425,53 +440,71 @@
   (global-set-key (kbd "s-<up>") 'move-text-up)
   (global-set-key (kbd "s-<down>") 'move-text-down))
 
+
+;; ============================
+;; Hl todo settings
+;; ============================
+(use-package hl-todo
+  :ensure t
+  :hook ((prog-mode . hl-todo-mode)
+         (text-mode . hl-todo-mode)))
+
+(setq hl-todo-keyword-faces
+      '(("TODO"   warning bold)
+        ("FIXME"  error bold)
+        ("NOTE"   success bold)
+        ("INFO"   font-lock-doc-face bold)
+        ("DEBUG"  font-lock-constant-face bold)))
+
+
+
 ;; ============================
 ;; Nuclear option: Disable Company completely
 ;; ============================
-(setq prelude-company nil)
+;; (setq prelude-company nil)
 
-(when (featurep 'company)
-  (global-company-mode -1)
-  (unload-feature 'company t))
+;; (when (featurep 'company)
+;;   (global-company-mode -1)
+;;   (unload-feature 'company t))
 
-(with-eval-after-load 'company
-  (global-company-mode -1))
+;; (with-eval-after-load 'company
+;;   (global-company-mode -1))
 
-(defun my/kill-company-in-buffer ()
-  "Ensure company-mode is off in current buffer."
-  (when (bound-and-true-p company-mode)
-    (company-mode -1)))
-(add-hook 'after-change-major-mode-hook #'my/kill-company-in-buffer)
+;; (defun my/kill-company-in-buffer ()
+;;   "Ensure company-mode is off in current buffer."
+;;   (when (bound-and-true-p company-mode)
+;;     (company-mode -1)))
+;; (add-hook 'after-change-major-mode-hook #'my/kill-company-in-buffer)
 
-(dolist (hook '(prog-mode-hook
-                python-mode-hook
-                emacs-lisp-mode-hook
-                go-mode-hook))
-  (add-hook hook (lambda () (company-mode -1)) 90))
+;; (dolist (hook '(prog-mode-hook
+;;                 python-mode-hook
+;;                 emacs-lisp-mode-hook
+;;                 go-mode-hook))
+;;   (add-hook hook (lambda () (company-mode -1)) 90))
 
-(defun my/prevent-company-mode (orig-fun &optional arg &rest args)
-  "Prevent company-mode from being enabled."
-  (when (or (not arg) (<= arg 0))
-    (apply orig-fun arg args)))
-(advice-add 'company-mode :around #'my/prevent-company-mode)
+;; (defun my/prevent-company-mode (orig-fun &optional arg &rest args)
+;;   "Prevent company-mode from being enabled."
+;;   (when (or (not arg) (<= arg 0))
+;;     (apply orig-fun arg args)))
+;; (advice-add 'company-mode :around #'my/prevent-company-mode)
 
 ;; ============================
 ;; Disable anaconda mode entirely
 ;; ============================
-(use-package anaconda-mode
-  :disabled t)
-(use-package company-anaconda
-  :disabled t)
+;; (use-package anaconda-mode
+;;   :disabled t)
+;; (use-package company-anaconda
+;;   :disabled t)
 
-(with-eval-after-load 'python
-  (remove-hook 'python-mode-hook 'anaconda-mode)
-  (remove-hook 'python-mode-hook 'anaconda-eldoc-mode))
+;; (with-eval-after-load 'python
+;;   (remove-hook 'python-mode-hook 'anaconda-mode)
+;;   (remove-hook 'python-mode-hook 'anaconda-eldoc-mode))
 
-(with-eval-after-load 'anaconda-mode
-  (setq anaconda-mode nil)
-  (setq anaconda-eldoc-mode nil)
-  (when (boundp 'anaconda-mode-map)
-    (setcdr anaconda-mode-map nil)))
+;; (with-eval-after-load 'anaconda-mode
+;;   (setq anaconda-mode nil)
+;;   (setq anaconda-eldoc-mode nil)
+;;   (when (boundp 'anaconda-mode-map)
+;;     (setcdr anaconda-mode-map nil)))
 
 ;; ============================
 ;; Auto detect python version
@@ -523,6 +556,295 @@
 (setq doom-themes-enable-bold t
       doom-themes-enable-italic t)
 
+
+;; -------------------------
+;; Terraform (.tf, .tfvars) + HCL (.hcl)
+;; Syntax highlighting + LSP (definitions/references/hover) + format on save
+;; -------------------------
+
+;; 1) Major modes (syntax highlighting)
+(use-package terraform-mode
+  :ensure t
+  :mode (("\\.tf\\'"     . terraform-mode)
+         ("\\.tfvars\\'" . terraform-mode)))
+
+(use-package hcl-mode
+  :ensure t
+  :mode (("\\.hcl\\'" . hcl-mode)))
+
+;; 2) (Optional) Prefer tree-sitter modes if you have them available
+;;    This won't error if they don't exist.
+(with-eval-after-load 'treesit
+  (when (fboundp 'terraform-ts-mode)
+    (add-to-list 'major-mode-remap-alist '(terraform-mode . terraform-ts-mode)))
+  (when (fboundp 'hcl-ts-mode)
+    (add-to-list 'major-mode-remap-alist '(hcl-mode . hcl-ts-mode))))
+
+;; 3) LSP wiring
+(with-eval-after-load 'lsp-mode
+  ;; Make sure LSP knows the language IDs
+  (add-to-list 'lsp-language-id-configuration '(terraform-mode . "terraform"))
+  (add-to-list 'lsp-language-id-configuration '(hcl-mode       . "hcl"))
+  (when (boundp 'lsp-language-id-configuration)
+    (when (fboundp 'terraform-ts-mode)
+      (add-to-list 'lsp-language-id-configuration '(terraform-ts-mode . "terraform")))
+    (when (fboundp 'hcl-ts-mode)
+      (add-to-list 'lsp-language-id-configuration '(hcl-ts-mode . "hcl"))))
+
+  ;; Start LSP automatically
+  (dolist (hook '(terraform-mode-hook hcl-mode-hook))
+    (add-hook hook #'lsp-deferred))
+  (when (fboundp 'terraform-ts-mode)
+    (add-hook 'terraform-ts-mode-hook #'lsp-deferred))
+  (when (fboundp 'hcl-ts-mode)
+    (add-hook 'hcl-ts-mode-hook #'lsp-deferred))
+
+  ;; Format on save via LSP
+  (defun my/terraform-hcl-lsp-format-on-save ()
+    "Format current buffer via LSP (Terraform/HCL)."
+    (when (and (bound-and-true-p lsp-mode)
+               (derived-mode-p 'terraform-mode 'hcl-mode
+                               'terraform-ts-mode 'hcl-ts-mode))
+      (lsp-format-buffer)))
+
+  (dolist (hook '(terraform-mode-hook hcl-mode-hook))
+    (add-hook hook (lambda ()
+                     (add-hook 'before-save-hook
+                               #'my/terraform-hcl-lsp-format-on-save
+                               nil t))))
+  (when (fboundp 'terraform-ts-mode)
+    (add-hook 'terraform-ts-mode-hook (lambda ()
+                                        (add-hook 'before-save-hook
+                                                  #'my/terraform-hcl-lsp-format-on-save
+                                                  nil t))))
+  (when (fboundp 'hcl-ts-mode)
+    (add-hook 'hcl-ts-mode-hook (lambda ()
+                                  (add-hook 'before-save-hook
+                                            #'my/terraform-hcl-lsp-format-on-save
+                                            nil t)))))
+
+
+;; -------------------------
+;; Fix PATH for macOS GUI Emacs
+;; -------------------------
+
+;; (add-to-list 'exec-path (expand-file-name "~/go/bin"))
+
+;; (setenv "PATH"
+;;         (concat (expand-file-name "~/go/bin")
+;;                 ":"
+;;                 (getenv "PATH")))
+
+;; -------------------------
+;; Go + gopls + tree-sitter
+;; -------------------------
+
+(use-package go-ts-mode
+  :mode ("\\.go\\'" . go-ts-mode)
+  :hook
+  (go-ts-mode . lsp-deferred)
+  (go-ts-mode . my/go-lsp-setup)
+  :config
+  ;; gopls settings
+  (setq lsp-go-use-gofumpt t)
+  (setq lsp-go-analyses '((unusedparams . t)
+                          (shadow . t)))
+  (setq lsp-go-staticcheck t)
+
+  ;; inlay hints
+  (setq lsp-go-inlay-hints-parameter-names t)
+  (setq lsp-go-inlay-hints-variable-types t)
+  (setq lsp-go-inlay-hints-constant-values t)
+  (setq lsp-go-inlay-hints-function-type-parameters t))
+
+;; -----------------------------------------
+;; language-id for go-ts-mode
+;; -----------------------------------------
+(with-eval-after-load 'lsp-mode
+  (add-to-list 'lsp-language-id-configuration
+               '(go-ts-mode . "go")))
+
+;; -----------------------------------------
+;; format + imports on save
+;; -----------------------------------------
+
+(defun my/go-lsp-format-on-save ()
+  "Format Go buffer using LSP."
+  (when (derived-mode-p 'go-mode 'go-ts-mode)
+    (lsp-format-buffer)))
+
+(defun my/go-lsp-organize-imports ()
+  "Organize Go imports via LSP."
+  (when (derived-mode-p 'go-mode 'go-ts-mode)
+    (lsp-organize-imports)))
+
+(defun my/go-lsp-setup ()
+  "Setup Go LSP save hooks."
+  (add-hook 'before-save-hook #'my/go-lsp-organize-imports nil t)
+  (add-hook 'before-save-hook #'my/go-lsp-format-on-save nil t))
+
+
+;; -------------------------
+;; Elixir + ElixirLS + tree-sitter
+;; -------------------------
+
+(use-package elixir-ts-mode
+:mode ("\.ex\'" . elixir-ts-mode)
+("\.exs\'" . elixir-ts-mode)
+:hook
+(elixir-ts-mode . lsp-deferred)
+(elixir-ts-mode . my/elixir-lsp-setup)
+:config
+;; LSP (ElixirLS) settings
+(setq lsp-elixir-fetch-deps t)
+(setq lsp-elixir-dialyzer-enabled t))
+
+;; -----------------------------------------
+;; language-id for elixir-ts-mode
+;; -----------------------------------------
+(with-eval-after-load 'lsp-mode
+(add-to-list 'lsp-language-id-configuration
+'(elixir-ts-mode . "elixir")))
+
+;; -----------------------------------------
+;; format + code actions on save
+;; -----------------------------------------
+
+(defun my/elixir-lsp-format-on-save ()
+"Format Elixir buffer using LSP."
+(when (derived-mode-p 'elixir-mode 'elixir-ts-mode)
+(lsp-format-buffer)))
+
+(defun my/elixir-lsp-organize-imports ()
+"Organize Elixir imports via LSP."
+(when (and (derived-mode-p 'elixir-mode 'elixir-ts-mode)
+(bound-and-true-p lsp-mode))
+(lsp-organize-imports)))
+
+(defun my/elixir-lsp-setup ()
+"Setup Elixir LSP save hooks."
+(add-hook 'before-save-hook #'my/elixir-lsp-format-on-save nil t)
+(add-hook 'before-save-hook #'my/elixir-lsp-organize-imports nil t))
+
+;; -----------------------------------------
+;; Ignore heavy Elixir build dirs (performance)
+;; -----------------------------------------
+(with-eval-after-load 'lsp-mode
+(add-to-list 'lsp-file-watch-ignored-directories "[/\\]_build$")
+(add-to-list 'lsp-file-watch-ignored-directories "[/\\]deps$"))
+
+;; -------------------------
+;; Fix PATH for macOS (brew)
+;; -------------------------
+(add-to-list 'exec-path "/Users/kanishk/elixir-ls/release")
+
+
+;; -------------------------
+;; Node.js / TypeScript + vtsls + tree-sitter
+;; -------------------------
+
+;; Use vtsls (VSCode-level TS/JS LSP)
+(add-to-list 'exec-path "/Users/kanishk/.nvm/versions/node/v24.14.0/bin")
+(setq lsp-clients-typescript-tls-path
+      (or (executable-find "vtsls") "vtsls"))
+
+;; -----------------------------------------
+;; language-id for tree-sitter modes
+;; -----------------------------------------
+(with-eval-after-load 'lsp-mode
+  (add-to-list 'lsp-language-id-configuration '(typescript-ts-mode . "typescript"))
+  (add-to-list 'lsp-language-id-configuration '(tsx-ts-mode        . "typescriptreact"))
+  (add-to-list 'lsp-language-id-configuration '(js-ts-mode         . "javascript")))
+
+;; -----------------------------------------
+;; format + organize imports on save
+;; -----------------------------------------
+
+(defun my/ts-lsp-format-on-save ()
+  "Format TS/JS buffer using LSP."
+  (when (derived-mode-p 'typescript-mode 'typescript-ts-mode
+                        'js-mode 'js-ts-mode 'tsx-ts-mode)
+    (lsp-format-buffer)))
+
+(defun my/ts-lsp-organize-imports ()
+  "Organize imports via LSP."
+  (when (and (derived-mode-p 'typescript-mode 'typescript-ts-mode
+                             'js-mode 'js-ts-mode 'tsx-ts-mode)
+             (bound-and-true-p lsp-mode))
+    (lsp-organize-imports)))
+
+(defun my/ts-lsp-setup ()
+  "Setup Node/TS LSP save hooks."
+  (add-hook 'before-save-hook #'my/ts-lsp-organize-imports nil t)
+  (add-hook 'before-save-hook #'my/ts-lsp-format-on-save nil t))
+
+;; -----------------------------------------
+;; tree-sitter modes
+;; -----------------------------------------
+
+(use-package typescript-ts-mode
+  :mode ("\\.ts\\'" . typescript-ts-mode)
+  :hook
+  (typescript-ts-mode . lsp-deferred)
+  (typescript-ts-mode . my/ts-lsp-setup))
+
+(use-package tsx-ts-mode
+  :mode ("\\.tsx\\'" . tsx-ts-mode)
+  :hook
+  (tsx-ts-mode . lsp-deferred)
+  (tsx-ts-mode . my/ts-lsp-setup))
+
+;; JS (already remapped, just ensure hooks)
+(add-hook 'js-ts-mode-hook #'lsp-deferred)
+(add-hook 'js-ts-mode-hook #'my/ts-lsp-setup)
+
+;; -----------------------------------------
+;; ESLint (built into lsp-mode)
+;; -----------------------------------------
+
+(with-eval-after-load 'lsp-mode
+  ;; Enable ESLint integration
+  (setq lsp-eslint-enable t)
+  (setq lsp-eslint-format t)
+  (setq lsp-eslint-run "onType"))
+
+(defun my/eslint-apply-fixes ()
+  "Apply ESLint fixes on save."
+  (when (and (bound-and-true-p lsp-mode)
+             (lsp-feature? "textDocument/codeAction"))
+    (lsp-execute-code-action-by-kind "source.fixAll.eslint")))
+
+(dolist (hook '(typescript-ts-mode-hook tsx-ts-mode-hook js-ts-mode-hook))
+  (add-hook hook
+            (lambda ()
+              (add-hook 'before-save-hook #'my/eslint-apply-fixes nil t))))
+;; -----------------------------------------
+;; Ignore heavy Node dirs (performance)
+;; -----------------------------------------
+
+(with-eval-after-load 'lsp-mode
+  (add-to-list 'lsp-file-watch-ignored-directories "[/\\\\]node_modules$")
+  (add-to-list 'lsp-file-watch-ignored-directories "[/\\\\]dist$")
+  (add-to-list 'lsp-file-watch-ignored-directories "[/\\\\]build$")
+  (add-to-list 'lsp-file-watch-ignored-directories "[/\\\\]\\.next$")
+  (add-to-list 'lsp-file-watch-ignored-directories "[/\\\\]out$"))
+
+;; -----------------------------------------
+;; vtsls tuning
+;; -----------------------------------------
+
+;; These are the `lsp-javascript` knobs used by the TS/JS client in lsp-mode.
+(setq lsp-javascript-suggest-auto-imports t)
+(setq lsp-typescript-suggest-auto-imports t)
+(setq lsp-clients-typescript-max-ts-server-memory 4096)
+(setq lsp-javascript-completions-complete-function-calls t)
+
+;; -----------------------------------------
+;; Performance tweaks (important for Node)
+;; -----------------------------------------
+
+(setq read-process-output-max (* 1024 1024)) ;; 1MB
+(setq gc-cons-threshold 100000000)
 
 ;; ====================
 ;; Doom Theme (daemon-safe)
