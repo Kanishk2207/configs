@@ -53,9 +53,17 @@
 (setq insert-directory-program "gls")
 
 ;; Binaries the daemon must see regardless of which shell launched it.
+;; /opt/homebrew/bin is needed both for `exec-path' lookups and for
+;; vterm's first-load compile (it shells out to `cmake', which reads the
+;; PATH env var, not `exec-path'), so keep both in sync.
 (dolist (dir '("/Users/kanishk/elixir-ls/release"
-               "/Users/kanishk/.nvm/versions/node/v24.14.0/bin"))
+               "/Users/kanishk/.nvm/versions/node/v24.14.0/bin"
+               "/opt/homebrew/bin"))
   (add-to-list 'exec-path dir))
+
+(let ((brew-bin "/opt/homebrew/bin"))
+  (unless (member brew-bin (split-string (or (getenv "PATH") "") path-separator))
+    (setenv "PATH" (concat brew-bin path-separator (getenv "PATH")))))
 
 ;; ============================================================
 ;; 3. Tree-sitter (Emacs 30 built-in modes)
@@ -70,7 +78,8 @@
         (c++-mode    . c++-ts-mode)
         (go-mode     . go-ts-mode)
         (rust-mode   . rust-ts-mode)
-        (elixir-mode . elixir-ts-mode)))
+        (elixir-mode . elixir-ts-mode)
+        (js-json-mode . json-ts-mode)))
 
 (setq treesit-font-lock-level 4)
 
@@ -206,6 +215,19 @@ Safe for both GUI and terminal frames: GUI-only tweaks are guarded."
   (when (yes-or-no-p "Really quit Emacs? ")
     (save-buffers-kill-terminal)))
 (global-set-key (kbd "C-x C-c") #'confirm-before-quit)
+
+;; Clipboard from terminal (tty) Emacs clients.  GUI frames already
+;; reach the macOS clipboard natively; tty clients don't -- clipetty
+;; sends kills to the terminal via OSC 52 so copies (including vterm's
+;; copy-mode) land on the system clipboard.  It only acts in terminal
+;; frames, so it's a no-op in GUI.  Requires the terminal emulator to
+;; allow OSC 52 clipboard writes:
+;;   - iTerm2: Settings > General > Selection >
+;;             "Applications in terminal may access clipboard"
+;;   - tmux:   set -g set-clipboard on
+(use-package clipetty
+  :ensure t
+  :hook (after-init . global-clipetty-mode))
 
 ;; ============================================================
 ;; 7. Completion (Corfu + Orderless + Swiper)
@@ -372,7 +394,8 @@ Safe for both GUI and terminal frames: GUI-only tweaks are guarded."
    (js-mode        . lsp)
    (js-ts-mode     . lsp)
    (rust-mode      . lsp)
-   (rust-ts-mode   . lsp))
+   (rust-ts-mode   . lsp)
+   (json-ts-mode   . lsp))
   :commands (lsp lsp-deferred))
 
 (use-package lsp-ui
@@ -406,7 +429,8 @@ Safe for both GUI and terminal frames: GUI-only tweaks are guarded."
                    (elixir-ts-mode     . "elixir")
                    (typescript-ts-mode . "typescript")
                    (tsx-ts-mode        . "typescriptreact")
-                   (js-ts-mode         . "javascript")))
+                   (js-ts-mode         . "javascript")
+                   (json-ts-mode       . "json")))
     (add-to-list 'lsp-language-id-configuration entry)))
 
 ;; Keep the file watcher out of heavy build/dependency dirs.
@@ -469,7 +493,301 @@ Uses lsp-mode's own display-action (`window' = other window) and forces
 ;; Claude Code (claude-code-ide.el over MCP)
 ;; ============================================================
 
-;; Pure-Elisp terminal backend: no native compile, daemon-friendly.
+;; Pull Claude's on-disk edits into open buffers promptly and without
+;; prompting, so the hand-off is smooth.  `global-auto-revert-mode' is
+;; already on (Prelude, prelude-editor.el), but the defaults poll every
+;; 5s.  Note: Emacs still refuses to revert a buffer with UNSAVED
+;; changes -- that is the real "ownership fight".  Save your buffers
+;; before letting Claude edit the same file.
+(with-eval-after-load 'autorevert
+  (setq auto-revert-use-notify t)     ;; file-system notifications, not polling
+  (setq auto-revert-interval 1)       ;; fallback poll: 1s instead of 5s
+  (setq auto-revert-verbose nil)
+  (setq revert-without-query '(".*"))) ;; never prompt on an unmodified buffer
+
+;; Terminal backend for claude-code-ide.  vterm renders Claude's
+;; full-screen TUI far more reliably than eat (no overlapping text) and
+;; the mouse behaves.  It compiles a native module on first load
+;; (cmake + libvterm, installed via Homebrew); this works under the
+;; daemon once built.  `eat' is kept installed as a pure-elisp fallback.
+(use-package vterm
+  :ensure t
+  :custom
+  (vterm-max-scrollback 10000)
+  :config
+  ;; tmux-style: `C-c [' enters copy mode -- a read-only Emacs view over
+  ;; the terminal and its scrollback.  In copy mode every normal Emacs
+  ;; motion key works as-is (C-a/C-e line ends, C-p/C-n/C-f/C-b,
+  ;; C-v/M-v page, C-s search).  Press `C-c [' again (or `q') to leave.
+  ;;
+  ;; In a Claude buffer, plain `C-c [' first dumps the whole conversation
+  ;; into scrollback so copy mode can reach the FULL history, not just the
+  ;; current screen (Claude's fullscreen TUI keeps history off-buffer; see
+  ;; `my/vterm-copy-or-history').  Use `C-u C-c [' to skip the dump and
+  ;; copy just the visible screen (instant).  Ordinary vterm shells are
+  ;; unaffected -- there `C-c [' is plain copy mode as before.
+  ;;
+  ;; NOTE: we deliberately do NOT use `C-SPC ['.  vterm binds C-SPC to
+  ;; self-insert, tmux uses C-Space as its prefix in tty clients, and
+  ;; macOS often grabs Ctrl+Space for input-source switching in GUI --
+  ;; so C-SPC is unreliable everywhere.  `C-c' is in
+  ;; `vterm-keymap-exceptions', so it always reaches Emacs.
+  (define-key vterm-mode-map      (kbd "C-c [") #'my/vterm-copy-or-history)
+  (define-key vterm-copy-mode-map (kbd "C-c [") #'vterm-copy-mode)
+  ;; In a full-screen TUI like Claude, line editing belongs to the app,
+  ;; not to vterm's shell-oriented C-a/C-e (which move the Emacs point to
+  ;; the buffer-line ends; in Claude that's the input-box border).  We
+  ;; send the dedicated Home/End keys rather than raw ^A/^E: Claude's TUI
+  ;; input reliably honors Home/End, whereas raw ^E after ^A was being
+  ;; dropped.  `vterm-send' translates the named key into the right
+  ;; terminal escape sequence.  Copy mode keeps vterm's C-a/C-e for
+  ;; buffer navigation, so we only rebind vterm-mode-map.
+  (define-key vterm-mode-map (kbd "C-a")
+              (lambda () (interactive) (vterm-send "<home>")))
+  (define-key vterm-mode-map (kbd "C-e")
+              (lambda () (interactive) (vterm-send "<end>"))))
+
+;; Prelude's minor mode (`prelude-mode') rebinds C-a (to
+;; crux-move-beginning-of-line) and M-o.  Minor-mode maps outrank the
+;; major-mode map, so in vterm those shadow vterm's own C-a/C-e -- C-a
+;; was running crux (moving the Emacs point) instead of reaching the
+;; shell, which is why nothing bound to C-a in vterm-mode-map ever fired.
+;; In a terminal we want keys to pass through, so neutralize
+;; prelude-mode's bindings buffer-locally with an empty override keymap
+;; (`minor-mode-overriding-map-alist' is automatically buffer-local),
+;; letting vterm-mode-map win.
+;; --- Mouse wheel / touchpad scrolling for Claude's full-screen TUI ---
+;;
+;; Claude Code runs in its "fullscreen" renderer (see `/tui fullscreen'):
+;; it draws on the terminal's ALTERNATE screen, like vim, so the
+;; conversation lives in Claude's own render state, NOT in vterm's buffer
+;; -- the buffer only ever holds the current screen.  So scrolling the
+;; Emacs buffer does nothing useful; you have to make Claude scroll.
+;; Claude scrolls its conversation when it receives mouse-wheel events,
+;; but vterm never forwards mouse events to the child program.  So do it
+;; ourselves: translate an Emacs wheel event into the SGR mouse escape a
+;; real terminal would send and write it straight down the PTY.  Claude
+;; then scrolls a few lines per notch, with its own acceleration and
+;; `CLAUDE_CODE_SCROLL_SPEED' (run `/scroll-speed' or set the env var; use
+;; a value < 1 to tame a fast trackpad).
+(defun my/vterm-wheel-scroll (event)
+  "Forward mouse-wheel EVENT to the terminal program as an SGR mouse event.
+In `vterm-copy-mode' (a read-only Emacs view) scroll the buffer normally
+instead, since there we are navigating Emacs, not the live program."
+  (interactive "e")
+  (if (bound-and-true-p vterm-copy-mode)
+      ;; Copy mode is a read-only Emacs view over the buffer, so scroll the
+      ;; buffer normally -- smoothly, and without erroring at the edges.
+      ;; NOTE: in Claude's fullscreen mode the buffer holds ONLY the current
+      ;; screen, so there is nothing to scroll here until you pull the
+      ;; transcript into it: press `C-o' then `[' in Claude to dump the whole
+      ;; conversation into the buffer, after which this scrolls all of it.
+      (ignore-errors
+        (if (fboundp 'pixel-scroll-precision)
+            (pixel-scroll-precision event)
+          (pcase (event-basic-type event)
+            ('wheel-up   (scroll-down-command 3))
+            ('wheel-down (scroll-up-command 3)))))
+    (let ((proc (and (boundp 'vterm--process) vterm--process)))
+      (when (and proc (process-live-p proc))
+        (let ((btn (pcase (event-basic-type event)
+                     ('wheel-up 64) ('wheel-down 65)
+                     ('wheel-left 66) ('wheel-right 67)))
+              (cr (posn-col-row (event-start event))))
+          (when btn
+            ;; SGR mouse press: ESC [ < Btn ; Col ; Row M  (1-based coords).
+            (process-send-string
+             proc (format "\e[<%d;%d;%dM" btn (1+ (car cr)) (1+ (cdr cr))))))))))
+
+(defvar my/vterm-wheel-map
+  (let ((m (make-sparse-keymap)))
+    (dolist (k '([wheel-up] [wheel-down] [wheel-left] [wheel-right]))
+      (define-key m k #'my/vterm-wheel-scroll))
+    m)
+  "Keymap that forwards wheel events to the terminal program.")
+
+;; --- Copy from Claude's off-screen history ---
+;;
+;; Because Claude's fullscreen TUI keeps the conversation on the alternate
+;; screen, vterm's buffer holds only the current screen and copy mode has
+;; nothing above it to reach.  Claude's transcript mode can write the whole
+;; conversation into the terminal as ordinary text (`Ctrl-o' then `['), which
+;; DOES populate vterm's scrollback.  `my/claude-dump-then-copy' automates
+;; that and drops into copy mode so you can scroll and select the full
+;; history.  Caveat: the render streams the entire conversation through
+;; vterm, so on very long conversations it can pause Emacs for a few
+;; seconds.  A lighter route is Claude's `v' (transcript -> temp file ->
+;; $EDITOR); set EDITOR/VISUAL to emacsclient and it opens straight in
+;; Emacs without the vterm render.
+(defun my/claude-dump-then-copy ()
+  "Write Claude's full conversation into vterm scrollback, then enter copy mode."
+  (let ((proc (and (boundp 'vterm--process) vterm--process)))
+    (unless (and proc (process-live-p proc))
+      (user-error "No live Claude process in this buffer"))
+    (when (fboundp 'vterm-clear-scrollback)
+      (ignore-errors (vterm-clear-scrollback)))  ; avoid stacking old dumps
+    (message "Claude: writing conversation to scrollback...")
+    (let ((base (buffer-size)))
+      (process-send-string proc "\C-o")          ; enter transcript mode
+      (accept-process-output proc 0.4)
+      (process-send-string proc "[")             ; dump conversation to scrollback
+      ;; Wait for the dump to START (buffer grows past baseline) BEFORE
+      ;; watching for it to finish.  Skipping the start wait was the bug: on
+      ;; any render latency the "stopped growing" test passed instantly, so we
+      ;; entered copy mode on a stale screen while the dump was still arriving.
+      (let ((n 0))
+        (while (and (< (buffer-size) (+ base 200)) (< n 30))
+          (accept-process-output proc 0.1)
+          (setq n (1+ n))))
+      ;; Now wait for it to FINISH: buffer size stable for ~0.8s.
+      (let ((last -1) (idle 0))
+        (while (and (< idle 5) (< (buffer-size) 20000000))
+          (accept-process-output proc 0.16)
+          (setq idle (if (= (buffer-size) last) (1+ idle) 0)
+                last (buffer-size)))))
+    (process-send-string proc "q")               ; back to the live screen
+    (accept-process-output proc 0.3)
+    (sleep-for 0.15)                             ; let the alt-screen finish repainting
+    (vterm-copy-mode 1)
+    ;; Keep the view exactly as it was: pin the live screen to the bottom of
+    ;; the window (so nothing appears to move), with the dumped history just
+    ;; above it -- scroll up to reach it.
+    (goto-char (point-max))
+    (when (get-buffer-window) (recenter -1))
+    (message "Claude: history in scrollback -- scroll up (M-v) to reach it, C-c [ to exit")))
+
+(defun my/vterm-copy-or-history (&optional arg)
+  "Enter `vterm-copy-mode'.
+In a Claude buffer, first dump the whole conversation into scrollback so
+copy mode can reach the full history (see `my/claude-dump-then-copy').
+With prefix ARG, or in an ordinary vterm shell, skip the dump and just
+toggle copy mode on the current screen."
+  (interactive "P")
+  (if (and (not arg)
+           (not (bound-and-true-p vterm-copy-mode))
+           (string-match-p "claude-code" (buffer-name)))
+      (my/claude-dump-then-copy)
+    (vterm-copy-mode 'toggle)))
+
+(defun my/vterm-let-terminal-own-keys ()
+  "Stop `prelude-mode' from shadowing vterm's own keybindings.
+Also apply a small redisplay-cost win for the terminal buffer."
+  (push (cons 'prelude-mode (make-sparse-keymap))
+        minor-mode-overriding-map-alist)
+  ;; Small redisplay-cost win: terminal output is left-to-right and never
+  ;; needs Emacs's bidirectional reordering engine (one of redisplay's
+  ;; bigger per-line costs), so pin the paragraph direction and skip bidi
+  ;; parenthesis analysis.
+  (setq-local bidi-paragraph-direction 'left-to-right)
+  (setq-local bidi-inhibit-bpa t)
+  ;; vterm stores its ANSI colors in the `font-lock-face' text property,
+  ;; which the display engine paints as a real face ONLY when `face' is
+  ;; aliased to `font-lock-face' -- an alias `font-lock-mode' normally
+  ;; installs.  We keep font-lock OFF in vterm for performance (see
+  ;; `my/vterm-disable-heavy-modes'), which removed that alias and left the
+  ;; terminal colorless even though the color properties were still there.
+  ;; So install the alias ourselves: this renders Claude's full color with
+  ;; none of font-lock's per-change overhead.
+  (setq-local char-property-alias-alist
+              (cons '(face font-lock-face)
+                    (default-value 'char-property-alias-alist)))
+  ;; NOTE: we used to throttle `vterm-timer-delay' to 0.2 here to stop
+  ;; Claude's constantly-repainting TUI from starving global redisplay.
+  ;; That was a band-aid: the real cause of the expensive redraws was
+  ;; heavy per-change minor modes running in the vterm buffer (font-lock,
+  ;; Flycheck, yascroll -- see `my/vterm-disable-heavy-modes').  With those
+  ;; excluded each redraw is cheap again, so we leave `vterm-timer-delay'
+  ;; at vterm's default (0.1s), which streams Claude's text smoothly.
+  (when (string-match-p "claude-code" (buffer-name))
+    ;; Forward the mouse wheel / touchpad to Claude (see
+    ;; `my/vterm-wheel-scroll').  Override BOTH the pixel-scroll and classic
+    ;; mouse-wheel minor modes, which grab wheel events at higher precedence
+    ;; than the major-mode map.  Only for Claude buffers: a plain vterm shell
+    ;; has no mouse mode, so there the wheel should keep scrolling the buffer.
+    (dolist (mode '(pixel-scroll-precision-mode mouse-wheel-mode))
+      (push (cons mode my/vterm-wheel-map) minor-mode-overriding-map-alist))
+    ;; Snap this window to the live screen when it is re-selected (see
+    ;; `my/claude-vterm-snap-to-bottom').  Registered BUFFER-LOCALLY (the
+    ;; trailing t) so it fires only for the Claude window's own selection
+    ;; changes -- a global hook here would run on every window switch in
+    ;; the frame.
+    (add-hook 'window-selection-change-functions
+              #'my/claude-vterm-snap-to-bottom nil t)))
+(add-hook 'vterm-mode-hook #'my/vterm-let-terminal-own-keys)
+
+;; Keep `global-display-line-numbers-mode' (enabled by Prelude in
+;; prelude-ui.el) out of terminal buffers.  Line numbers are useless in a
+;; terminal and, worse, vterm reserves a left margin for the gutter and
+;; subtracts it from the PTY width it reports to the child -- with a 10000
+;; line scrollback that is 9 columns, which is the blank strip on the
+;; right of Claude's full-screen TUI.  The global enabler runs on
+;; `after-change-major-mode-hook', which fires *after* `vterm-mode-hook',
+;; so disabling in the mode hook gets clobbered; we append to the same
+;; hook instead so our disable runs last and wins.
+(defun my/vterm-no-line-numbers ()
+  "Turn off `display-line-numbers-mode' in vterm buffers."
+  (when (derived-mode-p 'vterm-mode)
+    (display-line-numbers-mode -1)))
+(add-hook 'after-change-major-mode-hook #'my/vterm-no-line-numbers t)
+
+;; Keep heavy global minor modes out of terminal buffers -- the single
+;; biggest cause of Claude-window lag.  vterm rewrites its buffer on
+;; every terminal repaint and fires `after-change-functions' MANY times
+;; per redraw; any globalized minor mode hooked there then runs on each
+;; of those edits.  Measured on this config: font-lock
+;; (`jit-lock-after-change'), Flycheck (`flycheck-handle-change') and
+;; yascroll (`yascroll:after-change') together turned a ~2ms vterm redraw
+;; into 60-190ms.  Because Emacs redisplay and the command loop are
+;; single-threaded, each such redraw froze the WHOLE UI for that long --
+;; so holding C-n or C-v while Claude repainted made the cursor hop in
+;; lockstep with its output.  None of these do anything useful in a
+;; terminal: there is no code to lint or scroll-map, and font-lock-mode's
+;; keyword fontification is meaningless here (vterm's own colors live in
+;; the `font-lock-face' property, which we render via a face alias set in
+;; `my/vterm-let-terminal-own-keys', NOT via font-lock-mode).  So exclude
+;; vterm-mode from the globalized modes.
+(setq font-lock-global-modes '(not vterm-mode))
+(with-eval-after-load 'flycheck
+  (setq flycheck-global-modes '(not vterm-mode)))
+
+;; Catch-all safety net: the globalized-mode enablers run from
+;; `after-change-major-mode-hook', so append a disable there (runs last,
+;; wins) for anything the exclusion lists above miss -- notably yascroll,
+;; which has no exclusion variable.
+(defun my/vterm-disable-heavy-modes ()
+  "Disable `after-change-functions' minor modes in vterm buffers."
+  (when (derived-mode-p 'vterm-mode)
+    (when (bound-and-true-p font-lock-mode) (font-lock-mode -1))
+    (when (and (fboundp 'flycheck-mode) (bound-and-true-p flycheck-mode))
+      (flycheck-mode -1))
+    (when (and (fboundp 'yascroll-bar-mode) (bound-and-true-p yascroll-bar-mode))
+      (yascroll-bar-mode -1))))
+(add-hook 'after-change-major-mode-hook #'my/vterm-disable-heavy-modes t)
+
+;; Snap Claude's window back to the live screen when you return to it.
+;; Claude is a full-screen TUI, so the only useful view is the bottom of
+;; the buffer (the current screen); the scrollback above it holds stale
+;; frames.  claude-code-ide sets `vterm-scroll-to-bottom-on-output' nil
+;; and its scroll "position keeper" only runs for the eat backend, not
+;; vterm -- so when you switch away, let Claude repaint, then switch back,
+;; the window is still showing the old viewport with the freshly redrawn
+;; prompt overlapping it (the duplicated prompt bar).  On re-selecting the
+;; window, jump to the process output so the live screen is what's shown.
+;; Guarded against copy mode (`C-c ['), where you are deliberately
+;; scrolled up reading history and must not be yanked to the bottom.
+(defun my/claude-vterm-snap-to-bottom (&rest _)
+  "Show Claude's live terminal screen when its window is re-selected.
+Added buffer-locally to `window-selection-change-functions' in the
+Claude vterm buffer (see `my/vterm-let-terminal-own-keys'), so it only
+runs for that window, never on ordinary window switches."
+  (let ((win (selected-window)))
+    (when (window-live-p win)
+      (with-current-buffer (window-buffer win)
+        (when (and (derived-mode-p 'vterm-mode)
+                   (not (bound-and-true-p vterm-copy-mode))
+                   (string-match-p "claude-code" (buffer-name)))
+          (set-window-point win (point-max)))))))
+
 (use-package eat
   :ensure t)
 
@@ -479,11 +797,63 @@ Uses lsp-mode's own display-action (`window' = other window) and forces
   :bind (("C-c C-'" . claude-code-ide-menu)
          ("M-i"     . my/claude-add-region-or-tab))
   :custom
-  (claude-code-ide-terminal-backend 'eat)
+  (claude-code-ide-terminal-backend 'vterm)
   (claude-code-ide-window-side 'right)
-  (claude-code-ide-no-flicker t)
+  ;; (claude-code-ide-no-flicker t)
+  ;; Turn OFF claude-code-ide's "smart renderer" anti-flicker path.  With it
+  ;; on (the default), claude-code-ide advises `vterm--filter' to detect
+  ;; Claude's full-screen repaints (cursor-up ESC[nA + clear-line ESC[K) and
+  ;; batch them behind a 5ms timer with redisplay inhibited.  But Claude's TUI
+  ;; (Ink) repaints the WHOLE screen every frame with exactly that pattern, so
+  ;; the batcher is firing constantly; when an output chunk splits an escape
+  ;; sequence or a repaint races the flush (common after a resize, and worse
+  ;; now that we read output in 1MB chunks), a frame lands at a stale cursor
+  ;; position and gets drawn on top of the previous one -- the overlapping,
+  ;; garbled text.  The advice re-reads this flag at runtime, so nil makes it a
+  ;; pass-through immediately (no daemon restart needed).  vterm's own renderer
+  ;; handles Ink's repaints correctly, which is why we chose vterm over eat.
+  (claude-code-ide-vterm-anti-flicker nil)
   :config
   (claude-code-ide-emacs-tools-setup))
+
+;; --- Let Claude's transcript `v' open in THIS Emacs ---
+;;
+;; In transcript mode (`C-o'), `v' writes the whole conversation to a temp
+;; file and opens it in $VISUAL/$EDITOR.  That is the light-weight way to
+;; grab off-screen history from a LONG conversation: a file open is cheap,
+;; unlike the `C-c [' scrollback dump which streams every line through
+;; vterm.  Point Claude's editor at a wrapper that runs `emacsclient -n'
+;; (`personal/claude-emacsclient'), so `v' pops the conversation into a
+;; normal Emacs buffer without freezing the Claude session.
+;;
+;; Scoped to the Claude launch via advice on the session creator, so it
+;; only touches the Claude subprocess -- your global EDITOR (git and
+;; friends in other buffers) is left alone.  Takes effect on the NEXT
+;; Claude session (an already-running one keeps its original environment).
+(defun my/claude-view-transcript (file)
+  "Open FILE, a Claude transcript dump, in a dedicated read-only view.
+Enables `view-mode', so `q' quits the window (and buries the buffer)
+like an ag/grep results buffer, while text stays selectable to copy.
+Invoked by `personal/claude-emacsclient', which Claude runs for its
+transcript-mode `v' command."
+  (let ((buf (find-file-noselect file)))
+    (with-current-buffer buf
+      (rename-buffer "*claude-transcript*" t)
+      (view-mode 1))                    ; read-only; `q' = View-quit
+    (pop-to-buffer buf)))
+
+(defvar vterm-environment)   ; declare special so the let below binds dynamically
+(defun my/claude-code-ide--use-emacsclient (orig &rest args)
+  "Launch Claude with VISUAL/EDITOR pointing at the no-wait emacsclient wrapper."
+  (let* ((ed (expand-file-name "personal/claude-emacsclient" user-emacs-directory))
+         (extra (list (concat "VISUAL=" ed) (concat "EDITOR=" ed)))
+         (process-environment (append extra process-environment))
+         (vterm-environment (append extra (and (boundp 'vterm-environment)
+                                               vterm-environment))))
+    (apply orig args)))
+(with-eval-after-load 'claude-code-ide
+  (advice-add 'claude-code-ide--create-terminal-session
+              :around #'my/claude-code-ide--use-emacsclient))
 
 (defun my/claude-add-region-or-tab ()
   "Region active: send it to Claude Code's context.
@@ -507,7 +877,7 @@ No region: fall back to `tab-to-tab-stop'."
 (defun my/main-window-columns (&optional frame)
   "Number of side-by-side columns in FRAME's main (non-side) window area."
   (let* ((main (window-main-window frame))
-         (child (window-chwild main)))
+         (child (window-child main)))
     (if (and child (window-combined-p child t))
         (let ((n 0))
           (while child
@@ -947,7 +1317,28 @@ Prelude's clojure hooks never fire there on their own."
 (setq lsp-javascript-completions-complete-function-calls t)
 
 ;; ============================================================
-;; 11g. Terraform / HCL
+;; 11g. JSON (vscode-json-language-server)
+;; ============================================================
+;;
+;; Install the language server with:
+;;   npm install -g vscode-langservers-extracted
+;; It ships the `vscode-json-language-server' binary lsp-mode uses,
+;; giving schema-aware completion, hover, and validation (package.json,
+;; tsconfig.json, and other known files validate automatically).
+
+(defun my/json-lsp-format-on-save ()
+  "Format JSON buffer via LSP."
+  (when (derived-mode-p 'json-ts-mode)
+    (lsp-format-buffer)))
+
+(defun my/json-lsp-setup ()
+  "Enable format-on-save for JSON buffers."
+  (add-hook 'before-save-hook #'my/json-lsp-format-on-save nil t))
+
+(add-hook 'json-ts-mode-hook #'my/json-lsp-setup)
+
+;; ============================================================
+;; 11h. Terraform / HCL
 ;; ============================================================
 
 (use-package terraform-mode

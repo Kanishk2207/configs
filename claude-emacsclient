@@ -1,0 +1,5 @@
+#!/bin/sh
+# Open a Claude transcript dump in a dedicated, q-to-quit Emacs view.
+# Used as $VISUAL/$EDITOR for the Claude Code subprocess (transcript `v`).
+# -e evaluates in the running daemon and returns immediately (non-blocking).
+exec /opt/homebrew/bin/emacsclient -e "(progn (my/claude-view-transcript \"$1\") nil)"
