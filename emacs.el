@@ -545,7 +545,11 @@ Uses lsp-mode's own display-action (`window' = other window) and forces
   (define-key vterm-mode-map (kbd "C-a")
               (lambda () (interactive) (vterm-send "<home>")))
   (define-key vterm-mode-map (kbd "C-e")
-              (lambda () (interactive) (vterm-send "<end>"))))
+              (lambda () (interactive) (vterm-send "<end>")))
+  ;; C-l: in a Claude buffer, a throttled redraw that can never become
+  ;; `/clear' no matter how often you press it; in an ordinary shell, the
+  ;; usual terminal C-l.  See `my/vterm-ctrl-l' / `my/claude-vterm-redraw'.
+  (define-key vterm-mode-map (kbd "C-l") #'my/vterm-ctrl-l))
 
 ;; Prelude's minor mode (`prelude-mode') rebinds C-a (to
 ;; crux-move-beginning-of-line) and M-o.  Minor-mode maps outrank the
@@ -712,7 +716,11 @@ Also apply a small redisplay-cost win for the terminal buffer."
     ;; changes -- a global hook here would run on every window switch in
     ;; the frame.
     (add-hook 'window-selection-change-functions
-              #'my/claude-vterm-snap-to-bottom nil t)))
+              #'my/claude-vterm-snap-to-bottom nil t)
+    ;; Repaint if the window was resized while we were away (project switch);
+    ;; see `my/claude-vterm-fix-layout'.
+    (add-hook 'window-selection-change-functions
+              #'my/claude-vterm-fix-layout nil t)))
 (add-hook 'vterm-mode-hook #'my/vterm-let-terminal-own-keys)
 
 ;; Keep `global-display-line-numbers-mode' (enabled by Prelude in
@@ -787,6 +795,82 @@ runs for that window, never on ordinary window switches."
                    (not (bound-and-true-p vterm-copy-mode))
                    (string-match-p "claude-code" (buffer-name)))
           (set-window-point win (point-max)))))))
+
+;; --- Repaint Claude after its window is resized (e.g. project switch) ---
+;;
+;; claude-code-ide suppresses HEIGHT-only reflows (a workaround for a
+;; streaming scroll glitch, upstream issue #1422).  The side effect: when a
+;; project switch reshows Claude's side window at a different height, Claude
+;; is never told the new height, so it keeps drawing its bottom-anchored
+;; input box at the old row and leaves stale fragments below it -- the
+;; input box looks split off from the prompt.  A plain resize signal does
+;; not fix it (Claude repaints incrementally and keeps the fragments); a
+;; single `C-l' makes Claude re-query the size and FULLY repaint, which
+;; clears them.  So on re-selecting the Claude window, if its size changed,
+;; send one `C-l'.
+;;
+;; The redraw uses `C-l' because it is bound to `chat:clearInput', the ONLY
+;; action that does the heavy clear-and-full-repaint that fixes the
+;; fragments (the lighter `app:redraw' does not re-query size, so it leaves
+;; the stale rows -- verified).  The catch is that `chat:clearInput's
+;; DOUBLE press within 2s is Claude's `/clear', and the two behaviors
+;; cannot be separated in Claude's settings (rebinding to an odd key does
+;; not work either: Claude does not recognize keys like Ctrl+\ from vterm).
+;;
+;; So we make `C-l' safe from the EMACS side.  `my/vterm-ctrl-l' handles
+;; C-l in the terminal (see the vterm `use-package'): in a Claude buffer it
+;; routes to `my/claude-vterm-redraw', which sends the raw C-l byte to the
+;; process (bypassing the keymap) but THROTTLES to at most once per 2.5s.
+;; Since `/clear' needs two presses within 2s, a throttled single send can
+;; never trigger it -- mash C-l all you like, it only ever refreshes.  The
+;; layout fix below shares the same throttled sender, so an automatic
+;; redraw and a manual C-l can never combine into `/clear' either.  To
+;; actually clear, type `/clear'.
+(defvar-local my/claude-vterm-last-redraw 0
+  "`float-time' of the last C-l redraw sent to this Claude buffer.")
+
+(defun my/claude-vterm-redraw ()
+  "Send one `chat:clearInput' redraw (raw C-l) to Claude, throttled.
+At most one send per 2.5s, so it can never be the `C-l' `C-l' within 2s
+that Claude reads as `/clear'.  Used for C-l in a Claude buffer and by
+`my/claude-vterm-fix-layout'."
+  (interactive)
+  (let ((proc (and (boundp 'vterm--process) vterm--process))
+        (now (float-time)))
+    (when (and proc (process-live-p proc)
+               (> (- now my/claude-vterm-last-redraw) 2.5))
+      (setq my/claude-vterm-last-redraw now)
+      (process-send-string proc "\C-l"))))
+
+(defun my/vterm-ctrl-l ()
+  "C-l in a vterm buffer.
+In a Claude buffer, a throttled redraw that can never become `/clear'
+\(see `my/claude-vterm-redraw').  In an ordinary shell, the normal
+terminal C-l (clear screen)."
+  (interactive)
+  (if (string-match-p "claude-code" (buffer-name))
+      (my/claude-vterm-redraw)
+    (vterm-send "C-l")))
+
+(defvar-local my/claude-vterm-last-size nil
+  "Last (WIDTH . HEIGHT) seen for this Claude window.")
+
+(defun my/claude-vterm-fix-layout (&rest _)
+  "Redraw Claude when its window size changed since it was last selected.
+Added buffer-locally to `window-selection-change-functions'."
+  (let ((win (selected-window)))
+    (when (window-live-p win)
+      (with-current-buffer (window-buffer win)
+        (when (and (derived-mode-p 'vterm-mode)
+                   (string-match-p "claude-code" (buffer-name))
+                   (not (bound-and-true-p vterm-copy-mode))
+                   (bound-and-true-p vterm--process)
+                   (process-live-p vterm--process))
+          (let ((size (cons (window-body-width win) (window-body-height win))))
+            (when (and my/claude-vterm-last-size
+                       (not (equal size my/claude-vterm-last-size)))
+              (my/claude-vterm-redraw))   ; throttled; safe from /clear
+            (setq my/claude-vterm-last-size size)))))))
 
 (use-package eat
   :ensure t)
