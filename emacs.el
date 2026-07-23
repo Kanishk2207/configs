@@ -549,7 +549,47 @@ Uses lsp-mode's own display-action (`window' = other window) and forces
   ;; C-l: in a Claude buffer, a throttled redraw that can never become
   ;; `/clear' no matter how often you press it; in an ordinary shell, the
   ;; usual terminal C-l.  See `my/vterm-ctrl-l' / `my/claude-vterm-redraw'.
-  (define-key vterm-mode-map (kbd "C-l") #'my/vterm-ctrl-l))
+  (define-key vterm-mode-map (kbd "C-l") #'my/vterm-ctrl-l)
+  ;; C-c C-e: edit the program's current input line in a real Emacs buffer.
+  ;; In a Claude buffer this sends Claude's `Ctrl-g' ("edit in editor"): Claude
+  ;; writes the prompt to a temp file, opens it with $VISUAL (our
+  ;; `personal/claude-emacsclient', which routes it back into THIS Emacs), and
+  ;; on `C-x #' replaces the input with what you saved.  That is the reliable
+  ;; way to select / kill / yank / rewrite arbitrary text in the prompt --
+  ;; unlike walking the terminal cursor with arrow keys, which loses races
+  ;; against Claude's constantly-repainting TUI.  We bind it here because
+  ;; Emacs itself swallows a real C-g (`keyboard-quit'), so it never reaches
+  ;; the program on its own.  See `my/vterm-edit-input-in-editor'.
+  (define-key vterm-mode-map (kbd "C-c C-e") #'my/vterm-edit-input-in-editor))
+
+;; --- Edit the program's input line in a real Emacs buffer ---
+;;
+;; Why not just select+delete in place?  A vterm selection is only an Emacs
+;; overlay; the text belongs to the child program (Claude, or a shell), and
+;; Emacs can only *send keystrokes*.  Deleting an arbitrary middle chunk means
+;; walking the program's cursor onto the selection with arrow-key sends and
+;; verifying each step against the rendered screen -- and that loses races
+;; against Claude's Ink TUI, which repaints the whole screen every frame (an
+;; arrow escape can get echoed as literal `^[[C', or a repaint can land
+;; mid-move).  So instead of fighting the terminal, hand the whole line to
+;; Emacs: Claude Code binds `Ctrl-g' (also `Ctrl-x Ctrl-e') to "edit in
+;; editor" -- it dumps the current prompt to a temp file, blocks on $VISUAL,
+;; and on exit replaces the input with the file's contents.  With $VISUAL set
+;; to `personal/claude-emacsclient' the file opens right here (see the advice
+;; on the session creator below), giving full Emacs editing -- region select,
+;; kill/yank, undo, multiple cursors -- with zero raciness.  Finish with the
+;; standard `C-x #' (server-edit) and Claude picks up your edit.
+(defun my/vterm-edit-input-in-editor ()
+  "Open the terminal program's current input in Emacs by sending `Ctrl-g'.
+Meant for a Claude buffer, where Ctrl-g is \"edit in editor\"; in a plain
+shell it is a harmless interrupt/bell.  We send Ctrl-g through the PTY
+because Emacs binds C-g to `keyboard-quit' and would otherwise eat it."
+  (interactive)
+  (let ((proc (and (boundp 'vterm--process) vterm--process)))
+    (unless (and proc (process-live-p proc))
+      (user-error "No live terminal process in this buffer"))
+    (vterm-send-key "g" nil nil t)      ; Ctrl-g
+    (message "Editing the prompt in Emacs -- C-c C-e to confirm, C-g to cancel")))
 
 ;; Prelude's minor mode (`prelude-mode') rebinds C-a (to
 ;; crux-move-beginning-of-line) and M-o.  Minor-mode maps outrank the
@@ -678,6 +718,15 @@ toggle copy mode on the current screen."
 Also apply a small redisplay-cost win for the terminal buffer."
   (push (cons 'prelude-mode (make-sparse-keymap))
         minor-mode-overriding-map-alist)
+  ;; Select-to-copy, like a normal terminal emulator: dragging out a
+  ;; selection in a vterm buffer copies it to the kill ring immediately --
+  ;; no `M-w' needed.  From the kill ring it reaches the system clipboard the
+  ;; usual way: natively on a GUI frame, and via clipetty's OSC 52 on a tty
+  ;; (the same path copy-mode's `M-w' already uses; needs `set -g
+  ;; set-clipboard on' in tmux and an OSC-52-capable terminal).  Buffer-local
+  ;; so it changes mouse behavior only inside terminals, never in your
+  ;; editing buffers.
+  (setq-local mouse-drag-copy-region t)
   ;; Small redisplay-cost win: terminal output is left-to-right and never
   ;; needs Emacs's bidirectional reordering engine (one of redisplay's
   ;; bigger per-line costs), so pin the paragraph direction and skip bidi
@@ -900,15 +949,24 @@ Added buffer-locally to `window-selection-change-functions'."
   :config
   (claude-code-ide-emacs-tools-setup))
 
-;; --- Let Claude's transcript `v' open in THIS Emacs ---
+;; --- Let Claude open files in THIS Emacs ($VISUAL/$EDITOR) ---
 ;;
-;; In transcript mode (`C-o'), `v' writes the whole conversation to a temp
-;; file and opens it in $VISUAL/$EDITOR.  That is the light-weight way to
-;; grab off-screen history from a LONG conversation: a file open is cheap,
-;; unlike the `C-c [' scrollback dump which streams every line through
-;; vterm.  Point Claude's editor at a wrapper that runs `emacsclient -n'
-;; (`personal/claude-emacsclient'), so `v' pops the conversation into a
-;; normal Emacs buffer without freezing the Claude session.
+;; Claude uses $VISUAL/$EDITOR for two things, and we point both at one
+;; wrapper (`personal/claude-emacsclient') that dispatches on the filename:
+;;
+;;   * Transcript `v' (in transcript mode, `C-o'): writes the whole
+;;     conversation to cc-transcript-<ts>.txt and opens it.  The wrapper opens
+;;     that NON-BLOCKING in a read-only, `q'-to-quit view (`emacsclient -e' ->
+;;     `my/claude-view-transcript'), so the Claude session is not frozen while
+;;     you read.  This is the light-weight way to grab off-screen history from
+;;     a LONG conversation -- a file open is cheap, unlike the `C-c ['
+;;     scrollback dump, which streams every line through vterm.
+;;
+;;   * Prompt edit `Ctrl-g' (see `my/vterm-edit-input-in-editor', on C-c C-e),
+;;     and `/memory' edits: the wrapper opens these BLOCKING and EDITABLE
+;;     (plain `emacsclient FILE'), because Claude waits for the editor to exit
+;;     and then reads the file back.  You get full Emacs editing of the prompt;
+;;     finish with `C-x #'.
 ;;
 ;; Scoped to the Claude launch via advice on the session creator, so it
 ;; only touches the Claude subprocess -- your global EDITOR (git and
@@ -928,7 +986,7 @@ transcript-mode `v' command."
 
 (defvar vterm-environment)   ; declare special so the let below binds dynamically
 (defun my/claude-code-ide--use-emacsclient (orig &rest args)
-  "Launch Claude with VISUAL/EDITOR pointing at the no-wait emacsclient wrapper."
+  "Launch Claude with VISUAL/EDITOR pointing at the emacsclient wrapper."
   (let* ((ed (expand-file-name "personal/claude-emacsclient" user-emacs-directory))
          (extra (list (concat "VISUAL=" ed) (concat "EDITOR=" ed)))
          (process-environment (append extra process-environment))
@@ -938,6 +996,116 @@ transcript-mode `v' command."
 (with-eval-after-load 'claude-code-ide
   (advice-add 'claude-code-ide--create-terminal-session
               :around #'my/claude-code-ide--use-emacsclient))
+
+;; --- Prompt-edit UX: own window, C-c C-e to confirm, C-g to cancel ---
+;;
+;; When Claude's `Ctrl-g' opens the prompt through the wrapper (see above),
+;; we want three things beyond a plain `emacsclient FILE':
+;;   1. It opens in its OWN window, not by replacing the buffer beside the
+;;      Claude side window.
+;;   2. `C-c C-e' (the same key that launched it) confirms: save and hand the
+;;      text back to Claude -- no need to remember `C-x #'.
+;;   3. `C-g' cancels: throw the edits away and restore the prompt Claude
+;;      started with.  (With an active region, C-g first just drops the
+;;      region, as usual -- so selecting-then-C-g doesn't nuke your edit.)
+;;
+;; The wrapper can't pass metadata to Emacs, so it TAGS the file first with a
+;; non-blocking `emacsclient -e (my/claude-register-prompt-edit ...)' and then
+;; opens it blocking.  `server-visit-hook' matches the tag and sets everything
+;; up.  Only files the wrapper registered get this treatment, so ordinary
+;; emacsclient edits (git commits in other buffers, etc.) are untouched.
+
+(defvar my/claude-prompt-edit-files nil
+  "Truenames of files the Claude editor wrapper flagged as prompt edits.
+Consumed once by `my/claude-prompt-edit--maybe-setup'.")
+
+(defvar-local my/claude-prompt-edit--original nil
+  "The prompt text Claude started with, for `my/claude-prompt-edit-cancel'.")
+
+(defun my/claude-register-prompt-edit (file)
+  "Flag FILE as a Claude prompt edit about to be opened by emacsclient.
+Called (non-blocking) by `personal/claude-emacsclient' just before it
+opens FILE blocking, so `server-visit-hook' can give it the prompt-edit
+UX.  Returns nil so the `emacsclient -e' that calls it prints nothing."
+  (cl-pushnew (file-truename file) my/claude-prompt-edit-files :test #'equal)
+  nil)
+
+(defun my/claude-prompt-edit--finish ()
+  "Save the current text back to Claude, then remove the edit window.
+Saving first leaves the buffer unmodified, so `server-edit' hands the
+file to the waiting client (and kills this temp buffer) without a
+\"Save?\" prompt.  Then drop the extra window and hop back to Claude."
+  (when (buffer-modified-p) (save-buffer))
+  (let ((win (selected-window)))
+    (server-edit)                       ; notify the client; kills this buffer
+    (when (and (window-live-p win) (not (one-window-p win)))
+      (ignore-errors (delete-window win)))
+    (let ((cw (seq-find (lambda (w)
+                          (string-match-p "claude-code"
+                                          (buffer-name (window-buffer w))))
+                        (window-list))))
+      (when (window-live-p cw) (select-window cw)))))
+
+(defun my/claude-prompt-edit-confirm ()
+  "Hand the edited prompt back to Claude (bound to `C-c C-e')."
+  (interactive)
+  (my/claude-prompt-edit--finish))
+
+(defun my/claude-prompt-edit-cancel ()
+  "Discard the edits and restore the prompt Claude started with."
+  (interactive)
+  (let ((inhibit-read-only t))
+    (erase-buffer)
+    (insert (or my/claude-prompt-edit--original "")))
+  (my/claude-prompt-edit--finish)
+  (message "Prompt edit cancelled -- original restored"))
+
+(defun my/claude-prompt-edit-cancel-or-quit ()
+  "Drop the active region if any (ordinary `C-g'); else cancel the edit."
+  (interactive)
+  (if (region-active-p)
+      (deactivate-mark)
+    (my/claude-prompt-edit-cancel)))
+
+(defvar my/claude-prompt-edit-mode-map
+  (let ((m (make-sparse-keymap)))
+    (define-key m (kbd "C-c C-e") #'my/claude-prompt-edit-confirm)
+    (define-key m (kbd "C-c C-c") #'my/claude-prompt-edit-confirm) ; git-commit muscle memory
+    (define-key m (kbd "C-g")     #'my/claude-prompt-edit-cancel-or-quit)
+    (define-key m (kbd "C-c C-k") #'my/claude-prompt-edit-cancel)  ; explicit cancel
+    m)
+  "Keymap for `my/claude-prompt-edit-mode'.")
+
+(define-minor-mode my/claude-prompt-edit-mode
+  "Minor mode while editing Claude's prompt in an emacsclient buffer.
+\\<my/claude-prompt-edit-mode-map>Finish with \\[my/claude-prompt-edit-confirm]; \
+abandon with \\[my/claude-prompt-edit-cancel]."
+  :lighter " Claude-Prompt"
+  (when my/claude-prompt-edit-mode
+    (setq-local header-line-format
+                (substitute-command-keys
+                 " Editing Claude prompt  \\`C-c C-e' confirm  ·  \\`C-g' cancel"))))
+
+(defun my/claude-prompt-edit--maybe-setup ()
+  "Set up the prompt-edit UX if the visited file was registered.
+Runs from `server-visit-hook' in the just-visited buffer.  Pre-displays
+the buffer in its own window; because `server-window' is nil, the server
+then just reuses that window (see `server-switch-buffer') instead of
+replacing the buffer next to Claude."
+  (when (and buffer-file-name
+             (member (file-truename buffer-file-name) my/claude-prompt-edit-files))
+    (setq my/claude-prompt-edit-files
+          (delete (file-truename buffer-file-name) my/claude-prompt-edit-files))
+    (setq my/claude-prompt-edit--original (buffer-string))
+    (my/claude-prompt-edit-mode 1)
+    ;; Open in a separate window: never the selected (Claude side) window,
+    ;; splitting a main window if needed.
+    (pop-to-buffer (current-buffer)
+                   '((display-buffer-reuse-window
+                      display-buffer-pop-up-window
+                      display-buffer-use-some-window)
+                     (inhibit-same-window . t)))))
+(add-hook 'server-visit-hook #'my/claude-prompt-edit--maybe-setup)
 
 (defun my/claude-add-region-or-tab ()
   "Region active: send it to Claude Code's context.
