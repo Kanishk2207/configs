@@ -514,6 +514,17 @@ Uses lsp-mode's own display-action (`window' = other window) and forces
   :ensure t
   :custom
   (vterm-max-scrollback 10000)
+  ;; How narrow the terminal may get before vterm stops shrinking it.
+  ;; vterm clamps the width it reports to the child to at least this many
+  ;; columns (see `vterm--window-adjust-process-window-size':
+  ;; `(max width vterm-min-window-width)').  The default is 80, so once the
+  ;; Claude window is narrower than 80 columns Claude keeps wrapping its
+  ;; output at 80 while the window is narrower -- and because vterm buffers
+  ;; use `truncate-lines', those over-wide lines get clipped at the right
+  ;; edge instead of wrapping (the "text leaks out of the window" bug).
+  ;; Lower the floor to 20 so the terminal keeps following the real window
+  ;; width down to 20 columns, wrapping to fit instead of leaking.
+  (vterm-min-window-width 20)
   :config
   ;; tmux-style: `C-c [' enters copy mode -- a read-only Emacs view over
   ;; the terminal and its scrollback.  In copy mode every normal Emacs
@@ -766,10 +777,10 @@ Also apply a small redisplay-cost win for the terminal buffer."
     ;; the frame.
     (add-hook 'window-selection-change-functions
               #'my/claude-vterm-snap-to-bottom nil t)
-    ;; Repaint if the window was resized while we were away (project switch);
-    ;; see `my/claude-vterm-fix-layout'.
+    ;; Repaint on every switch back, so a prompt bar left distorted while we
+    ;; were away is always cleared; see `my/claude-vterm-redraw-on-select'.
     (add-hook 'window-selection-change-functions
-              #'my/claude-vterm-fix-layout nil t)))
+              #'my/claude-vterm-redraw-on-select nil t)))
 (add-hook 'vterm-mode-hook #'my/vterm-let-terminal-own-keys)
 
 ;; Keep `global-display-line-numbers-mode' (enabled by Prelude in
@@ -845,18 +856,19 @@ runs for that window, never on ordinary window switches."
                    (string-match-p "claude-code" (buffer-name)))
           (set-window-point win (point-max)))))))
 
-;; --- Repaint Claude after its window is resized (e.g. project switch) ---
+;; --- Repaint Claude whenever you switch back to its window ---
 ;;
-;; claude-code-ide suppresses HEIGHT-only reflows (a workaround for a
-;; streaming scroll glitch, upstream issue #1422).  The side effect: when a
-;; project switch reshows Claude's side window at a different height, Claude
-;; is never told the new height, so it keeps drawing its bottom-anchored
-;; input box at the old row and leaves stale fragments below it -- the
-;; input box looks split off from the prompt.  A plain resize signal does
-;; not fix it (Claude repaints incrementally and keeps the fragments); a
-;; single `C-l' makes Claude re-query the size and FULLY repaint, which
-;; clears them.  So on re-selecting the Claude window, if its size changed,
-;; send one `C-l'.
+;; Claude's TUI often leaves its bottom-anchored input box drawn at a stale
+;; row after you have been away -- the "distorted prompt bar."  One common
+;; trigger is a project switch: claude-code-ide suppresses HEIGHT-only
+;; reflows (a workaround for a streaming scroll glitch, upstream issue
+;; #1422), so when the side window comes back at a different height Claude
+;; is never told, keeps drawing its input box at the old row, and leaves
+;; stale fragments below it.  Incremental repaints can also settle wrong on
+;; their own.  A plain resize signal does not fix it (Claude repaints
+;; incrementally and keeps the fragments); a single `C-l' makes Claude
+;; re-query the size and FULLY repaint, which clears them.  So on
+;; re-selecting the Claude window, always send one `C-l'.
 ;;
 ;; The redraw uses `C-l' because it is bound to `chat:clearInput', the ONLY
 ;; action that does the heavy clear-and-full-repaint that fixes the
@@ -872,7 +884,7 @@ runs for that window, never on ordinary window switches."
 ;; process (bypassing the keymap) but THROTTLES to at most once per 2.5s.
 ;; Since `/clear' needs two presses within 2s, a throttled single send can
 ;; never trigger it -- mash C-l all you like, it only ever refreshes.  The
-;; layout fix below shares the same throttled sender, so an automatic
+;; on-select redraw below shares the same throttled sender, so an automatic
 ;; redraw and a manual C-l can never combine into `/clear' either.  To
 ;; actually clear, type `/clear'.
 (defvar-local my/claude-vterm-last-redraw 0
@@ -882,7 +894,7 @@ runs for that window, never on ordinary window switches."
   "Send one `chat:clearInput' redraw (raw C-l) to Claude, throttled.
 At most one send per 2.5s, so it can never be the `C-l' `C-l' within 2s
 that Claude reads as `/clear'.  Used for C-l in a Claude buffer and by
-`my/claude-vterm-fix-layout'."
+`my/claude-vterm-redraw-on-select'."
   (interactive)
   (let ((proc (and (boundp 'vterm--process) vterm--process))
         (now (float-time)))
@@ -901,12 +913,15 @@ terminal C-l (clear screen)."
       (my/claude-vterm-redraw)
     (vterm-send "C-l")))
 
-(defvar-local my/claude-vterm-last-size nil
-  "Last (WIDTH . HEIGHT) seen for this Claude window.")
-
-(defun my/claude-vterm-fix-layout (&rest _)
-  "Redraw Claude when its window size changed since it was last selected.
-Added buffer-locally to `window-selection-change-functions'."
+(defun my/claude-vterm-redraw-on-select (&rest _)
+  "Repaint Claude every time its window is (re-)selected.
+Sends one throttled `C-l' redraw (see `my/claude-vterm-redraw') so a
+distorted prompt bar is cleared whenever you switch back to Claude --
+whatever left it stale (a project-switch resize, an unsettled incremental
+repaint, ...).  Added buffer-locally to `window-selection-change-functions',
+so it runs only for the Claude window, never on ordinary window switches.
+The throttle in `my/claude-vterm-redraw' means rapid switching never spams
+Claude and can never pair into the `/clear' double-press."
   (let ((win (selected-window)))
     (when (window-live-p win)
       (with-current-buffer (window-buffer win)
@@ -915,11 +930,130 @@ Added buffer-locally to `window-selection-change-functions'."
                    (not (bound-and-true-p vterm-copy-mode))
                    (bound-and-true-p vterm--process)
                    (process-live-p vterm--process))
-          (let ((size (cons (window-body-width win) (window-body-height win))))
-            (when (and my/claude-vterm-last-size
-                       (not (equal size my/claude-vterm-last-size)))
-              (my/claude-vterm-redraw))   ; throttled; safe from /clear
-            (setq my/claude-vterm-last-size size)))))))
+          (my/claude-vterm-redraw))))))   ; throttled; safe from /clear
+
+;; --- Keep libvterm's grid height in sync with Claude's PTY height ---
+;;
+;; THE root cause of the garbled / distorted Claude TUI (overlapping text,
+;; stale prompt bar, cleared only by resizing the frame).
+;;
+;; claude-code-ide's bug-#1422 workaround (`claude-code-ide-prevent-reflow-glitch')
+;; advises vterm's window-size adjuster to SUPPRESS height-only reflows -- but
+;; the way it suppresses is broken.  It calls the real adjuster FIRST
+;; (`vterm--window-adjust-process-window-size' -> `vterm--set-size'), which
+;; resizes *libvterm's* internal grid to the new height, and only THEN returns
+;; nil.  Emacs pushes a new size down to the child (Claude) via
+;; `set-process-window-size' ONLY when the adjuster returns non-nil (see
+;; window.el `window--adjust-process-windows').  So on every height-only change
+;; libvterm gets resized but Claude is never told: libvterm ends up one height,
+;; Claude another.  Claude then paints its full-screen TUI -- bottom-anchored
+;; input box, cursor-relative moves -- for its OLD row count into libvterm's
+;; NEW grid, so frames land at the wrong rows and overlap.  That is the
+;; garbling.
+;;
+;; Height-only changes fire constantly here: the echo area growing/shrinking a
+;; line, a transient minibuffer message, an ediff/diff window opening, a
+;; project switch reshowing the side window.  Each one widens the desync, which
+;; is why the TUI corrupts "for no reason" (e.g. mid code-generation) and why a
+;; real frame resize -- which also changes WIDTH -- is what clears it: a width
+;; change makes the adjuster return non-nil, so Claude finally learns the true
+;; size and does one clean full repaint.
+;;
+;; Fix: disable claude-code-ide's broken workaround (see the `:custom' block on
+;; `claude-code-ide' below) and install a correct one.  On a height-only change
+;; we touch NOTHING -- neither resize libvterm nor tell Claude -- so the two can
+;; never disagree and the TUI never garbles.  A genuine width change falls
+;; through to the real adjuster, which resizes libvterm and, by returning the
+;; size, makes Emacs tell Claude too: one clean repaint.  This keeps the point
+;; of the #1422 fix (no height-only reflow is ever pushed to Claude mid-stream)
+;; without the size desync.  The `C-l' redraw above is now just a belt-and-
+;; suspenders for non-size repaint settling, not the primary cure.
+(defvar-local my/claude-last-pty-width nil
+  "Last terminal WIDTH propagated to this Claude process, for change detection.")
+
+(defun my/claude-vterm-sync-size (orig-fn &rest args)
+  "Around advice for `vterm--window-adjust-process-window-size'.
+In a Claude buffer, only let a size change reach libvterm/Claude when the
+WIDTH changed; suppress height-only changes so libvterm's grid and Claude's
+PTY never drift apart (see the commentary above).  Any other vterm buffer is
+adjusted exactly as usual."
+  (if (not (string-match-p "claude-code" (buffer-name)))
+      (apply orig-fn args)
+    ;; Compute the size vterm would apply WITHOUT side effects, using the same
+    ;; function vterm itself uses, so we can detect a width change cheaply.
+    (let* ((size (ignore-errors
+                   (funcall window-adjust-process-window-size-function
+                            (nth 0 args) (nth 1 args))))
+           (new-w (and (consp size) (car size))))
+      (cond
+       ;; Copy mode is a read-only Emacs view; never resize (matches vterm).
+       ((bound-and-true-p vterm-copy-mode) nil)
+       ;; Width changed (or this is the first adjust): resize libvterm AND, by
+       ;; returning non-nil from ORIG-FN, let Emacs push the new size to Claude.
+       ((and new-w (not (eql new-w my/claude-last-pty-width)))
+        (setq-local my/claude-last-pty-width new-w)
+        (apply orig-fn args))
+       ;; Height-only wobble: leave the grid untouched so both sides agree.
+       (t nil)))))
+
+(with-eval-after-load 'vterm
+  (advice-add 'vterm--window-adjust-process-window-size
+              :around #'my/claude-vterm-sync-size))
+
+;; If a session already installed claude-code-ide's broken reflow filter
+;; (e.g. on a live config reload, before the daemon is restarted), drop it --
+;; `my/claude-vterm-sync-size' replaces it.  On a fresh daemon the defcustom
+;; below keeps it from ever being added.
+(with-eval-after-load 'claude-code-ide
+  (when (fboundp 'claude-code-ide--terminal-reflow-filter)
+    (advice-remove 'vterm--window-adjust-process-window-size
+                   #'claude-code-ide--terminal-reflow-filter)))
+
+;; --- Sync libvterm's grid at OPEN, not just Claude's PTY ---
+;;
+;; The garbled TUI when the Claude window first opens (and a plain `C-l' won't
+;; clear it -- only a resize does) is the same size desync as before, on a code
+;; path `my/claude-vterm-sync-size' does not see.  When claude-code-ide first
+;; displays the Claude buffer it calls `claude-code-ide--sync-terminal-dimensions',
+;; which does `set-process-window-size' DIRECTLY -- telling Claude the window
+;; size but never calling `vterm--set-size', so libvterm's grid keeps its
+;; creation size.  Claude then paints for the window size into libvterm's
+;; different grid: overlap.  `C-l' can't fix it because it only asks Claude to
+;; repaint into that same mismatched grid; a real resize does fix it because it
+;; finally resizes libvterm to match.
+;;
+;; Fix: wrap that function so, for the vterm backend, it resizes libvterm to the
+;; SAME dimensions it is about to hand Claude (keeping the two in lockstep from
+;; the first frame), then sends one clean full repaint (`C-l') once Claude has
+;; taken the size.  Because libvterm is already correct, that repaint lands
+;; clean.
+(defun my/claude-sync-terminal-dims-fix (orig-fn buffer window)
+  "Around `claude-code-ide--sync-terminal-dimensions'.
+For the vterm backend, resize libvterm to the same dimensions Claude is told,
+so the grid and Claude agree at open; then schedule one clean redraw."
+  (if (and (eq claude-code-ide-terminal-backend 'vterm)
+           (buffer-live-p buffer) (window-live-p window))
+      (with-current-buffer buffer
+        (let ((height (window-body-height window))
+              (width  (window-body-width window)))
+          (when (and (bound-and-true-p vterm--term)
+                     (fboundp 'vterm--set-size)
+                     (> height 0) (> width 0)
+                     (not (bound-and-true-p vterm-copy-mode)))
+            (ignore-errors (vterm--set-size vterm--term height width))
+            (setq-local my/claude-last-pty-width width))
+          (prog1 (funcall orig-fn buffer window)
+            (when-let ((proc (get-buffer-process buffer)))
+              (run-at-time 0.3 nil
+                           (lambda (p)
+                             (when (and (processp p) (process-live-p p))
+                               (process-send-string p "\C-l")))
+                           proc)))))
+    (funcall orig-fn buffer window)))
+
+(with-eval-after-load 'claude-code-ide
+  (advice-add 'claude-code-ide--sync-terminal-dimensions
+              :around #'my/claude-sync-terminal-dims-fix))
 
 (use-package eat
   :ensure t)
@@ -932,6 +1066,21 @@ Added buffer-locally to `window-selection-change-functions'."
   :custom
   (claude-code-ide-terminal-backend 'vterm)
   (claude-code-ide-window-side 'right)
+  ;; Turn OFF claude-code-ide's bug-#1422 reflow workaround.  It resizes
+  ;; libvterm's grid on a height-only change but withholds the new size from
+  ;; Claude, so libvterm and Claude disagree on the row count and Claude's
+  ;; full-screen repaints overlap -- the garbled TUI that only a frame resize
+  ;; cleared.  `my/claude-vterm-sync-size' (see above) replaces it with a
+  ;; version that keeps the two in lockstep.
+  (claude-code-ide-prevent-reflow-glitch nil)
+  ;; Keep the Claude window visible during ediff (default t), but make the
+  ;; three windows -- diff pane A, diff pane B and Claude -- equal thirds
+  ;; instead of Claude eating half.  See `my/claude-ediff-equal-thirds' below,
+  ;; which runs on `ediff-startup-hook' after claude-code-ide re-displays the
+  ;; Claude side window.  (That side window is pinned to
+  ;; `claude-code-ide-window-width' = 100 and, being a side window, is exempt
+  ;; from `C-x +' / `balance-windows' -- which is why balancing by hand did
+  ;; nothing.)
   ;; (claude-code-ide-no-flicker t)
   ;; Turn OFF claude-code-ide's "smart renderer" anti-flicker path.  With it
   ;; on (the default), claude-code-ide advises `vterm--filter' to detect
@@ -948,6 +1097,73 @@ Added buffer-locally to `window-selection-change-functions'."
   (claude-code-ide-vterm-anti-flicker nil)
   :config
   (claude-code-ide-emacs-tools-setup))
+
+;; --- Equal-width windows when Claude opens an ediff ---
+;;
+;; claude-code-ide shows a diff by (1) deleting side windows, (2) running ediff
+;; with `ediff-setup-windows-plain' + `split-window-horizontally' so the two
+;; diff panes fill the frame side by side, then (3) on `ediff-startup-hook'
+;; re-displaying the Claude buffer as a right side window pinned to
+;; `claude-code-ide-window-width' (100).  That leaves Claude at ~half the frame
+;; and squeezes both diff panes into the other half.  A side window is exempt
+;; from `balance-windows' (`C-x +'), so it cannot be fixed by hand.
+;;
+;; Fix: once that startup has run, resize the three content windows -- diff
+;; pane A, diff pane B and the Claude window -- to an equal third of their
+;; combined width.
+;;
+;; Two subtleties learned the hard way:
+;;  * Don't rely on `ediff-control-buffer' or the current buffer: claude-code-ide's
+;;    own startup hook runs first and calls `select-window', so by the time we
+;;    run the current buffer is Claude's, where `ediff-control-buffer' is nil.
+;;    Instead we find the windows by scanning the frame.
+;;  * Run DEFERRED (a 0-delay timer) so it lands after ediff and claude-code-ide
+;;    have finished arranging windows, otherwise our resize gets overwritten.
+(defun my/claude-ediff-windows (&optional frame)
+  "Return (CLAUDE-WIN PANE-1 PANE-2) if a Claude ediff is laid out in FRAME.
+CLAUDE-WIN is the Claude side window; PANE-1/PANE-2 are the two diff panes
+\(non-side windows that are not the ediff control panel).  nil otherwise."
+  (let* ((frame (or frame (selected-frame)))
+         (wins (window-list frame 'no-mini))
+         (wc (seq-find
+              (lambda (w)
+                (and (window-parameter w 'window-side)
+                     (string-match-p "claude-code" (buffer-name (window-buffer w)))))
+              wins))
+         (panes (seq-filter
+                 (lambda (w)
+                   (and (not (window-parameter w 'window-side))
+                        (not (string-match-p "Ediff Control Panel"
+                                             (buffer-name (window-buffer w))))))
+                 wins)))
+    (when (and (window-live-p wc) (= (length panes) 2))
+      (list wc (car panes) (cadr panes)))))
+
+(defun my/claude-ediff-equal-thirds (&optional frame)
+  "Make the two ediff diff panes and the Claude side window equal thirds.
+No-op unless a Claude ediff is laid out in FRAME (see `my/claude-ediff-windows'),
+so ordinary ediff sessions are left alone."
+  (interactive)
+  (when-let ((wins (my/claude-ediff-windows frame)))
+    (let* ((total (apply #'+ (mapcar #'window-total-width wins)))
+           (target (/ total 3)))
+      ;; Resize the Claude window (at the frame/side level) and the first pane
+      ;; (at the A|B content-row level) to a third each; the second pane absorbs
+      ;; the remainder (also a third, modulo one column).  Clear any width lock
+      ;; and window-parameter guards so the side window can actually move.
+      (dolist (w (list (nth 0 wins) (nth 1 wins)))
+        (let ((delta (- target (window-total-width w))))
+          (when (/= delta 0)
+            (with-current-buffer (window-buffer w)
+              (let ((window-size-fixed nil)
+                    (ignore-window-parameters t))
+                (ignore-errors (window-resize w delta t))))))))))
+
+(defun my/claude-ediff-equal-thirds--deferred (&rest _)
+  "Schedule `my/claude-ediff-equal-thirds' after window setup settles."
+  (run-at-time 0.05 nil #'my/claude-ediff-equal-thirds))
+
+(add-hook 'ediff-startup-hook #'my/claude-ediff-equal-thirds--deferred t)
 
 ;; --- Let Claude open files in THIS Emacs ($VISUAL/$EDITOR) ---
 ;;
@@ -1139,24 +1355,33 @@ No region: fall back to `tab-to-tab-stop'."
       1)))
 
 (defun my/balance-windows-including-side ()
-  "Like `balance-windows', but also equalize left/right side windows."
+  "Like `balance-windows', but also equalize left/right side windows.
+During a Claude ediff, make the two diff panes and the Claude window equal
+thirds and leave the Ediff Control Panel untouched -- plain `balance-windows'
+here would equalize the control panel's vertical split and blow it up to
+half-height (the mystery window), and would give Claude a full half."
   (interactive)
-  (let* ((frame (selected-frame))
-         (side-windows
-          (seq-filter (lambda (w)
-                        (memq (window-parameter w 'window-side) '(left right)))
-                      (window-list frame 'no-minibuffer))))
-    (if (null side-windows)
-        (balance-windows frame)
-      (let* ((columns (+ (my/main-window-columns frame) (length side-windows)))
-             (target (floor (window-total-width (frame-root-window frame))
-                            columns)))
-        (dolist (w side-windows)
-          (ignore-errors
-            (window-resize w (- target (window-total-width w)) t)))
-        ;; Balance ONLY the main area; balancing the whole frame would
-        ;; give the side window half again (see comment above).
-        (balance-windows (window-main-window frame))))))
+  (cond
+   ;; Claude ediff in progress: three equal columns, control panel left alone.
+   ((my/claude-ediff-windows)
+    (my/claude-ediff-equal-thirds))
+   (t
+    (let* ((frame (selected-frame))
+           (side-windows
+            (seq-filter (lambda (w)
+                          (memq (window-parameter w 'window-side) '(left right)))
+                        (window-list frame 'no-minibuffer))))
+      (if (null side-windows)
+          (balance-windows frame)
+        (let* ((columns (+ (my/main-window-columns frame) (length side-windows)))
+               (target (floor (window-total-width (frame-root-window frame))
+                              columns)))
+          (dolist (w side-windows)
+            (ignore-errors
+              (window-resize w (- target (window-total-width w)) t)))
+          ;; Balance ONLY the main area; balancing the whole frame would
+          ;; give the side window half again (see comment above).
+          (balance-windows (window-main-window frame))))))))
 
 (global-set-key (kbd "C-x +") #'my/balance-windows-including-side)
 
