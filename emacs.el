@@ -611,6 +611,57 @@ because Emacs binds C-g to `keyboard-quit' and would otherwise eat it."
 ;; prelude-mode's bindings buffer-locally with an empty override keymap
 ;; (`minor-mode-overriding-map-alist' is automatically buffer-local),
 ;; letting vterm-mode-map win.
+
+;; --- Which Claude Code TUI mode is active (fullscreen vs inline) ---
+;;
+;; Claude Code has two renderers (`/tui'): `fullscreen' draws on the terminal's
+;; ALTERNATE screen (like vim; no scrollback -- the conversation lives in
+;; Claude's own state), and `default' (inline) appends to the terminal's NATIVE
+;; scrollback.  vterm does not expose which one is active, so we track it here
+;; and keep it in step with Claude via `my/claude-toggle-tui'.  A few behaviours
+;; below (the mouse wheel, `C-c [') depend on it.
+;;
+;; DEFAULT is `fullscreen', matching everything this config was built for, so
+;; nothing changes until you switch: every mode-dependent branch is inert while
+;; this stays `fullscreen'.  To roll back to fullscreen it is enough to set this
+;; back to `fullscreen' (or run `my/claude-toggle-tui').
+(defvar my/claude-tui-mode 'fullscreen
+  "Claude Code TUI mode this config assumes: `fullscreen' or `default'.
+Kept in sync with Claude's `/tui' setting by `my/claude-toggle-tui'.  Gates
+the mouse-wheel handler and `C-c ['.  Session-local: on a fresh Emacs it
+resets to `fullscreen'; if you make inline your permanent Claude mode, also
+set this to `default' in your config.")
+
+(defun my/claude--buffer ()
+  "Return a live Claude Code vterm buffer, or nil."
+  (or (and (derived-mode-p 'vterm-mode)
+           (string-match-p "claude-code" (buffer-name))
+           (current-buffer))
+      (seq-find (lambda (b)
+                  (with-current-buffer b
+                    (and (derived-mode-p 'vterm-mode)
+                         (string-match-p "claude-code" (buffer-name))
+                         (bound-and-true-p vterm--process)
+                         (process-live-p vterm--process))))
+                (buffer-list))))
+
+(defun my/claude-toggle-tui ()
+  "Toggle Claude Code between `fullscreen' and `default' (inline) rendering.
+Sends the matching `/tui' command to Claude AND flips `my/claude-tui-mode' so
+the Emacs side (mouse wheel, `C-c [') matches.  Run it with the Claude prompt
+empty.  Reversible: run it again to switch back."
+  (interactive)
+  (let ((buf (or (my/claude--buffer)
+                 (user-error "No live Claude Code vterm buffer found")))
+        (new (if (eq my/claude-tui-mode 'fullscreen) 'default 'fullscreen)))
+    (with-current-buffer buf
+      (when (bound-and-true-p vterm-copy-mode) (vterm-copy-mode -1))
+      (vterm-send-string (format "/tui %s" new))
+      (vterm-send-return))
+    (setq my/claude-tui-mode new)
+    (message "Claude TUI -> %s.  Emacs wheel/`C-c [' now match %s mode."
+             new new)))
+
 ;; --- Mouse wheel / touchpad scrolling for Claude's full-screen TUI ---
 ;;
 ;; Claude Code runs in its "fullscreen" renderer (see `/tui fullscreen'):
@@ -627,16 +678,19 @@ because Emacs binds C-g to `keyboard-quit' and would otherwise eat it."
 ;; a value < 1 to tame a fast trackpad).
 (defun my/vterm-wheel-scroll (event)
   "Forward mouse-wheel EVENT to the terminal program as an SGR mouse event.
-In `vterm-copy-mode' (a read-only Emacs view) scroll the buffer normally
-instead, since there we are navigating Emacs, not the live program."
+Scroll the Emacs buffer instead when we are navigating Emacs rather than the
+live program: in `vterm-copy-mode' (a read-only view), or when
+`my/claude-tui-mode' is `default' (Claude renders inline into vterm's own
+scrollback, so the wheel should scroll that scrollback, not be forwarded to a
+Claude that is not tracking the mouse)."
   (interactive "e")
-  (if (bound-and-true-p vterm-copy-mode)
-      ;; Copy mode is a read-only Emacs view over the buffer, so scroll the
-      ;; buffer normally -- smoothly, and without erroring at the edges.
-      ;; NOTE: in Claude's fullscreen mode the buffer holds ONLY the current
-      ;; screen, so there is nothing to scroll here until you pull the
-      ;; transcript into it: press `C-o' then `[' in Claude to dump the whole
-      ;; conversation into the buffer, after which this scrolls all of it.
+  (if (or (bound-and-true-p vterm-copy-mode)
+          (eq my/claude-tui-mode 'default))
+      ;; Navigating the Emacs buffer: scroll it normally -- smoothly, and
+      ;; without erroring at the edges.  NOTE: in Claude's FULLSCREEN mode the
+      ;; buffer holds ONLY the current screen, so in copy mode there is nothing
+      ;; to scroll until you pull the transcript in (`C-o' then `[').  In
+      ;; `default' (inline) mode the scrollback already holds the conversation.
       (ignore-errors
         (if (fboundp 'pixel-scroll-precision)
             (pixel-scroll-precision event)
@@ -713,13 +767,15 @@ instead, since there we are navigating Emacs, not the live program."
 
 (defun my/vterm-copy-or-history (&optional arg)
   "Enter `vterm-copy-mode'.
-In a Claude buffer, first dump the whole conversation into scrollback so
-copy mode can reach the full history (see `my/claude-dump-then-copy').
-With prefix ARG, or in an ordinary vterm shell, skip the dump and just
-toggle copy mode on the current screen."
+In a FULLSCREEN Claude buffer, first dump the whole conversation into
+scrollback so copy mode can reach the full history (see
+`my/claude-dump-then-copy').  With prefix ARG, in an ordinary vterm shell, or
+in `default' (inline) mode -- where the scrollback already holds the whole
+conversation -- skip the dump and just toggle copy mode."
   (interactive "P")
   (if (and (not arg)
            (not (bound-and-true-p vterm-copy-mode))
+           (eq my/claude-tui-mode 'fullscreen)
            (string-match-p "claude-code" (buffer-name)))
       (my/claude-dump-then-copy)
     (vterm-copy-mode 'toggle)))
