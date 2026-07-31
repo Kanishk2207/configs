@@ -531,12 +531,19 @@ Uses lsp-mode's own display-action (`window' = other window) and forces
   ;; motion key works as-is (C-a/C-e line ends, C-p/C-n/C-f/C-b,
   ;; C-v/M-v page, C-s search).  Press `C-c [' again (or `q') to leave.
   ;;
-  ;; In a Claude buffer, plain `C-c [' first dumps the whole conversation
-  ;; into scrollback so copy mode can reach the FULL history, not just the
-  ;; current screen (Claude's fullscreen TUI keeps history off-buffer; see
-  ;; `my/vterm-copy-or-history').  Use `C-u C-c [' to skip the dump and
-  ;; copy just the visible screen (instant).  Ordinary vterm shells are
-  ;; unaffected -- there `C-c [' is plain copy mode as before.
+  ;; In a Claude buffer, plain `C-c [' EXPORTS the whole conversation to a
+  ;; plain-text file and opens it in a read-only Emacs buffer (`q' to quit,
+  ;; fully selectable) -- Claude's fullscreen TUI keeps history off-buffer,
+  ;; so this is how you reach the FULL history (see
+  ;; `my/vterm-copy-or-history' / `my/claude-transcript-to-file').  We use
+  ;; the file export, NOT the old scrollback dump, because replaying Claude's
+  ;; repainting TUI render into vterm scrollback preserves every intermediate
+  ;; repaint frame as history -- so copy mode showed the same blocks twice
+  ;; (the "duplicated text in scrollback" bug).  The file is written once, so
+  ;; it is clean, and it does not stream every line through vterm.  Use
+  ;; `C-u C-c [' to skip the export and copy just the visible screen
+  ;; (instant).  Ordinary vterm shells are unaffected -- there `C-c [' is
+  ;; plain copy mode as before.
   ;;
   ;; NOTE: we deliberately do NOT use `C-SPC ['.  vterm binds C-SPC to
   ;; self-insert, tmux uses C-Space as its prefix in tty clients, and
@@ -632,18 +639,41 @@ the mouse-wheel handler and `C-c ['.  Session-local: on a fresh Emacs it
 resets to `fullscreen'; if you make inline your permanent Claude mode, also
 set this to `default' in your config.")
 
+;; BACKEND-AGNOSTIC on purpose: these two are the only Claude helpers here that
+;; are invoked by name (`M-x my/claude-toggle-tui') rather than from a
+;; `vterm-mode-hook' or a `vterm-mode-map' key, so unlike everything else above
+;; they must keep working after `claude-code-ide-terminal-backend' changes.  They
+;; match any of the three terminal modes and send through claude-code-ide's own
+;; dispatchers (`claude-code-ide--terminal-send-string' / `--send-return'), which
+;; pick the right primitive per backend.
+(defun my/claude--terminal-buffer-p ()
+  "Non-nil if the current buffer is a Claude Code terminal buffer.
+True for any backend: `vterm', `eat' or `ghostel'."
+  (and (derived-mode-p 'vterm-mode 'eat-mode 'ghostel-mode)
+       (string-match-p "claude-code" (buffer-name))))
+
 (defun my/claude--buffer ()
-  "Return a live Claude Code vterm buffer, or nil."
-  (or (and (derived-mode-p 'vterm-mode)
-           (string-match-p "claude-code" (buffer-name))
-           (current-buffer))
+  "Return a live Claude Code terminal buffer, or nil."
+  (or (and (my/claude--terminal-buffer-p) (current-buffer))
       (seq-find (lambda (b)
                   (with-current-buffer b
-                    (and (derived-mode-p 'vterm-mode)
-                         (string-match-p "claude-code" (buffer-name))
-                         (bound-and-true-p vterm--process)
-                         (process-live-p vterm--process))))
+                    (and (my/claude--terminal-buffer-p)
+                         ;; `get-buffer-process' works for all three backends,
+                         ;; unlike the vterm-only `vterm--process'.
+                         (process-live-p (get-buffer-process b)))))
                 (buffer-list))))
+
+(defun my/claude--resume-live-input ()
+  "Leave any frozen/read-only view so keystrokes reach Claude again.
+vterm calls it copy mode; ghostel has several read-only input modes and
+`semi-char' is the universal exit.  No-op when already live."
+  (cond
+   ((bound-and-true-p vterm-copy-mode)
+    (vterm-copy-mode -1))
+   ((and (derived-mode-p 'ghostel-mode)
+         (fboundp 'ghostel-semi-char-mode)
+         (not (eq (bound-and-true-p ghostel--input-mode) 'semi-char)))
+    (ghostel-semi-char-mode))))
 
 (defun my/claude-toggle-tui ()
   "Toggle Claude Code between `fullscreen' and `default' (inline) rendering.
@@ -652,12 +682,12 @@ the Emacs side (mouse wheel, `C-c [') matches.  Run it with the Claude prompt
 empty.  Reversible: run it again to switch back."
   (interactive)
   (let ((buf (or (my/claude--buffer)
-                 (user-error "No live Claude Code vterm buffer found")))
+                 (user-error "No live Claude Code terminal buffer found")))
         (new (if (eq my/claude-tui-mode 'fullscreen) 'default 'fullscreen)))
     (with-current-buffer buf
-      (when (bound-and-true-p vterm-copy-mode) (vterm-copy-mode -1))
-      (vterm-send-string (format "/tui %s" new))
-      (vterm-send-return))
+      (my/claude--resume-live-input)
+      (claude-code-ide--terminal-send-string (format "/tui %s" new))
+      (claude-code-ide--terminal-send-return))
     (setq my/claude-tui-mode new)
     (message "Claude TUI -> %s.  Emacs wheel/`C-c [' now match %s mode."
              new new)))
@@ -765,19 +795,67 @@ Claude that is not tracking the mouse)."
     (when (get-buffer-window) (recenter -1))
     (message "Claude: history in scrollback -- scroll up (M-v) to reach it, C-c [ to exit")))
 
+;; --- Reliable full-history copy: export the transcript to a FILE ---
+;;
+;; `my/claude-dump-then-copy' (above) reconstructs history by replaying Claude's
+;; conversation into vterm's scrollback (`Ctrl-o' then `['), then reads it in
+;; copy mode.  That is fragile: Claude's Ink TUI renders in FRAMES and repaints
+;; regions by rewriting lines, and vterm -- a faithful terminal -- commits every
+;; intermediate repaint frame to scrollback.  So any block Claude re-emits mid-
+;; dump (constant for long code blocks that scroll) lands in scrollback TWICE,
+;; and copy mode shows duplicated text.  You cannot dedup it safely either,
+;; because code blocks legitimately repeat in a conversation.
+;;
+;; The clean route is Claude's transcript `v': it writes the WHOLE conversation
+;; ONCE, as plain text, to `cc-transcript-<ts>.txt' and opens it through
+;; $VISUAL.  Our wrapper (`personal/claude-emacsclient') routes that to
+;; `my/claude-view-transcript', a read-only, `q'-to-quit Emacs view.  No repaint
+;; frames means no duplicates, it is far faster (no streaming through vterm), and
+;; a real Emacs buffer is better for copying anyway (swiper, region kill, etc.).
+(defun my/claude-transcript-to-file ()
+  "Export Claude's full conversation to a file and open it in Emacs.
+Sends transcript-mode `v', so Claude writes the whole conversation to a temp
+file and opens it via $VISUAL (`personal/claude-emacsclient'), landing in a
+read-only view (`my/claude-view-transcript').  Written once as plain text, so
+-- unlike the scrollback dump (`my/claude-dump-then-copy') -- it has no repaint
+duplicates."
+  (let ((proc (and (boundp 'vterm--process) vterm--process)))
+    (unless (and proc (process-live-p proc))
+      (user-error "No live Claude process in this buffer"))
+    (message "Claude: exporting transcript to a file...")
+    (process-send-string proc "\C-o")   ; enter transcript mode
+    (accept-process-output proc 0.4)
+    (process-send-string proc "v")      ; write transcript file + open in $VISUAL
+    (accept-process-output proc 0.4)
+    (process-send-string proc "q")      ; leave transcript mode, back to live chat
+    (accept-process-output proc 0.2)))
+
 (defun my/vterm-copy-or-history (&optional arg)
-  "Enter `vterm-copy-mode'.
-In a FULLSCREEN Claude buffer, first dump the whole conversation into
-scrollback so copy mode can reach the full history (see
-`my/claude-dump-then-copy').  With prefix ARG, in an ordinary vterm shell, or
-in `default' (inline) mode -- where the scrollback already holds the whole
-conversation -- skip the dump and just toggle copy mode."
+  "Toggle `vterm-copy-mode', or (with prefix ARG) export Claude's history.
+Plain `C-c [' toggles copy mode over the visible screen + scrollback -- the
+fast path, and the useful one in default (inline) mode where vterm's native
+scrollback holds the conversation.  (Caveat: in default mode that scrollback
+can contain DUPLICATED blocks, because Claude's Ink TUI re-emits any streamed
+block taller than the viewport -- the lines that scrolled off the top can no
+longer be rewritten in place, so they land in scrollback twice.  Use the
+prefix export below when you need clean, duplicate-free history.)
+
+With prefix ARG (`C-u C-c ['), in a Claude buffer, export the whole
+conversation to a plain-text file and open it read-only (see
+`my/claude-transcript-to-file') -- written ONCE, so no repaint duplicates.
+CAVEAT: the export drives Claude's transcript mode (`C-o' then `v'), and the
+`v'/`[' export subcommands exist only in the FULLSCREEN renderer.  `C-o'
+itself opens a transcript viewer in default (inline) mode too, but there it
+offers only `C-e' (show all content) and `q' -- no `v', so this export is a
+no-op in default mode.  Switch to fullscreen (`my/claude-toggle-tui') to use it.
+
+In an ordinary (non-Claude) vterm shell, or when already in copy mode, this
+just toggles copy mode regardless of ARG."
   (interactive "P")
-  (if (and (not arg)
+  (if (and arg
            (not (bound-and-true-p vterm-copy-mode))
-           (eq my/claude-tui-mode 'fullscreen)
            (string-match-p "claude-code" (buffer-name)))
-      (my/claude-dump-then-copy)
+      (my/claude-transcript-to-file)
     (vterm-copy-mode 'toggle)))
 
 (defun my/vterm-let-terminal-own-keys ()
@@ -834,10 +912,41 @@ Also apply a small redisplay-cost win for the terminal buffer."
     (add-hook 'window-selection-change-functions
               #'my/claude-vterm-snap-to-bottom nil t)
     ;; Repaint on every switch back, so a prompt bar left distorted while we
-    ;; were away is always cleared; see `my/claude-vterm-redraw-on-select'.
+    ;; were away is cleared; see `my/claude-vterm-redraw-on-select'.  Shares
+    ;; the single throttle in `my/claude-vterm-redraw', so it can never pair
+    ;; with any other C-l into `/clear'.
     (add-hook 'window-selection-change-functions
               #'my/claude-vterm-redraw-on-select nil t)))
 (add-hook 'vterm-mode-hook #'my/vterm-let-terminal-own-keys)
+
+;; --- The same, for ghostel ---
+;;
+;; Only two of the vterm items above still apply to ghostel, because ghostel
+;; already does the rest itself in its mode body (`font-lock-mode -1',
+;; `buffer-disable-undo', `truncate-lines', `scroll-margin' 0, and `inhibit-quit'
+;; so a real C-g reaches the program instead of `keyboard-quit'):
+;;
+;;   1. `prelude-mode' still wins.  ghostel installs its input maps with
+;;      `use-local-map' (`ghostel-semi-char-mode-map' and friends), which is
+;;      major-mode level -- and minor-mode maps outrank that, exactly as with
+;;      vterm.  Without this, prelude's C-a (crux) and M-o never reach Claude.
+;;   2. bidi is pure cost in a terminal.
+;;
+;; No `char-property-alias-alist' aliasing here: ghostel writes real `face'
+;; properties, so it stays colored with font-lock off.  No wheel map either --
+;; ghostel forwards the wheel to a mouse-tracking TUI natively.
+(defun my/ghostel-let-terminal-own-keys ()
+  "Stop `prelude-mode' from shadowing ghostel's own input keymaps."
+  (push (cons 'prelude-mode (make-sparse-keymap))
+        minor-mode-overriding-map-alist)
+  ;; Select-to-copy like a normal terminal emulator.  ghostel additionally
+  ;; freezes the buffer on drag release (`ghostel-mouse-drag-input-mode'), so the
+  ;; selection survives streaming output; this just also puts it on the kill
+  ;; ring, from where clipetty's OSC 52 carries it on tty frames.
+  (setq-local mouse-drag-copy-region t)
+  (setq-local bidi-paragraph-direction 'left-to-right)
+  (setq-local bidi-inhibit-bpa t))
+(add-hook 'ghostel-mode-hook #'my/ghostel-let-terminal-own-keys)
 
 ;; Keep `global-display-line-numbers-mode' (enabled by Prelude in
 ;; prelude-ui.el) out of terminal buffers.  Line numbers are useless in a
@@ -849,8 +958,8 @@ Also apply a small redisplay-cost win for the terminal buffer."
 ;; so disabling in the mode hook gets clobbered; we append to the same
 ;; hook instead so our disable runs last and wins.
 (defun my/vterm-no-line-numbers ()
-  "Turn off `display-line-numbers-mode' in vterm buffers."
-  (when (derived-mode-p 'vterm-mode)
+  "Turn off `display-line-numbers-mode' in terminal buffers."
+  (when (derived-mode-p 'vterm-mode 'ghostel-mode)
     (display-line-numbers-mode -1)))
 (add-hook 'after-change-major-mode-hook #'my/vterm-no-line-numbers t)
 
@@ -870,17 +979,22 @@ Also apply a small redisplay-cost win for the terminal buffer."
 ;; the `font-lock-face' property, which we render via a face alias set in
 ;; `my/vterm-let-terminal-own-keys', NOT via font-lock-mode).  So exclude
 ;; vterm-mode from the globalized modes.
-(setq font-lock-global-modes '(not vterm-mode))
+;; ghostel needs the same treatment for the same reason, but note the ONE
+;; difference from vterm: ghostel's native module writes real `face' text
+;; properties (it even neutralizes `font-lock-unfontify-region-function' so a
+;; globally-forced font-lock cannot strip them), so unlike vterm it needs NO
+;; `char-property-alias-alist' aliasing to stay colored with font-lock off.
+(setq font-lock-global-modes '(not vterm-mode ghostel-mode))
 (with-eval-after-load 'flycheck
-  (setq flycheck-global-modes '(not vterm-mode)))
+  (setq flycheck-global-modes '(not vterm-mode ghostel-mode)))
 
 ;; Catch-all safety net: the globalized-mode enablers run from
 ;; `after-change-major-mode-hook', so append a disable there (runs last,
 ;; wins) for anything the exclusion lists above miss -- notably yascroll,
 ;; which has no exclusion variable.
 (defun my/vterm-disable-heavy-modes ()
-  "Disable `after-change-functions' minor modes in vterm buffers."
-  (when (derived-mode-p 'vterm-mode)
+  "Disable `after-change-functions' minor modes in terminal buffers."
+  (when (derived-mode-p 'vterm-mode 'ghostel-mode)
     (when (bound-and-true-p font-lock-mode) (font-lock-mode -1))
     (when (and (fboundp 'flycheck-mode) (bound-and-true-p flycheck-mode))
       (flycheck-mode -1))
@@ -912,45 +1026,41 @@ runs for that window, never on ordinary window switches."
                    (string-match-p "claude-code" (buffer-name)))
           (set-window-point win (point-max)))))))
 
-;; --- Repaint Claude whenever you switch back to its window ---
+;; --- Repaint a distorted Claude prompt bar (C-l), one shared throttle ---
 ;;
-;; Claude's TUI often leaves its bottom-anchored input box drawn at a stale
-;; row after you have been away -- the "distorted prompt bar."  One common
-;; trigger is a project switch: claude-code-ide suppresses HEIGHT-only
-;; reflows (a workaround for a streaming scroll glitch, upstream issue
-;; #1422), so when the side window comes back at a different height Claude
-;; is never told, keeps drawing its input box at the old row, and leaves
-;; stale fragments below it.  Incremental repaints can also settle wrong on
-;; their own.  A plain resize signal does not fix it (Claude repaints
-;; incrementally and keeps the fragments); a single `C-l' makes Claude
-;; re-query the size and FULLY repaint, which clears them.  So on
-;; re-selecting the Claude window, always send one `C-l'.
+;; Claude's TUI can leave its bottom-anchored input box drawn at a stale row
+;; -- the "distorted prompt bar."  The ROOT CAUSE (libvterm grid vs Claude PTY
+;; drift) is fixed by `my/claude-vterm-sync-size' and
+;; `my/claude-sync-terminal-dims-fix' (below), so it is now rare; when it does
+;; happen, one `C-l' makes Claude re-query its size and FULLY repaint, clearing
+;; it.  `C-l' is `chat:clearInput', the only action that does that heavy
+;; clear-and-full-repaint (the lighter `app:redraw' does not re-query size --
+;; verified).
 ;;
-;; The redraw uses `C-l' because it is bound to `chat:clearInput', the ONLY
-;; action that does the heavy clear-and-full-repaint that fixes the
-;; fragments (the lighter `app:redraw' does not re-query size, so it leaves
-;; the stale rows -- verified).  The catch is that `chat:clearInput's
-;; DOUBLE press within 2s is Claude's `/clear', and the two behaviors
-;; cannot be separated in Claude's settings (rebinding to an odd key does
-;; not work either: Claude does not recognize keys like Ctrl+\ from vterm).
+;; EVERY C-l we send to Claude -- manual (`my/vterm-ctrl-l'), automatic on
+;; window select (`my/claude-vterm-redraw-on-select'), and the open-time
+;; repaint (`my/claude-sync-terminal-dims-fix') -- goes through the ONE sender
+;; below, `my/claude-vterm-redraw', which THROTTLES to at most one send per
+;; 2.5s per buffer.  `chat:clearInput' pressed TWICE within 2s is Claude's
+;; `/clear'; a single throttled send can never be that pair, no matter how many
+;; sources fire or how fast you switch windows.  To actually clear, type
+;; `/clear'.
 ;;
-;; So we make `C-l' safe from the EMACS side.  `my/vterm-ctrl-l' handles
-;; C-l in the terminal (see the vterm `use-package'): in a Claude buffer it
-;; routes to `my/claude-vterm-redraw', which sends the raw C-l byte to the
-;; process (bypassing the keymap) but THROTTLES to at most once per 2.5s.
-;; Since `/clear' needs two presses within 2s, a throttled single send can
-;; never trigger it -- mash C-l all you like, it only ever refreshes.  The
-;; on-select redraw below shares the same throttled sender, so an automatic
-;; redraw and a manual C-l can never combine into `/clear' either.  To
-;; actually clear, type `/clear'.
+;; A SINGLE `chat:clearInput' does NOT wipe the text you have typed in the
+;; prompt box (verified) -- it just triggers the clear-and-full-repaint.  So
+;; the on-select redraw is safe to fire freely; its only guard is the throttle,
+;; which exists solely to stop two sends pairing into `/clear'.  The bug that
+;; started all this was exactly that pairing: several unthrottled C-l sources
+;; (on-select + open-time) landing within 2s, which Claude read as `/clear'.
 (defvar-local my/claude-vterm-last-redraw 0
   "`float-time' of the last C-l redraw sent to this Claude buffer.")
 
 (defun my/claude-vterm-redraw ()
   "Send one `chat:clearInput' redraw (raw C-l) to Claude, throttled.
 At most one send per 2.5s, so it can never be the `C-l' `C-l' within 2s
-that Claude reads as `/clear'.  Used for C-l in a Claude buffer and by
-`my/claude-vterm-redraw-on-select'."
+that Claude reads as `/clear'.  The single shared sender for C-l in a Claude
+buffer: used by `my/vterm-ctrl-l', `my/claude-vterm-redraw-on-select', and the
+open-time repaint in `my/claude-sync-terminal-dims-fix'."
   (interactive)
   (let ((proc (and (boundp 'vterm--process) vterm--process))
         (now (float-time)))
@@ -1099,17 +1209,74 @@ so the grid and Claude agree at open; then schedule one clean redraw."
             (ignore-errors (vterm--set-size vterm--term height width))
             (setq-local my/claude-last-pty-width width))
           (prog1 (funcall orig-fn buffer window)
-            (when-let ((proc (get-buffer-process buffer)))
+            (when (get-buffer-process buffer)
+              ;; Route the open-time repaint through the shared throttle
+              ;; (`my/claude-vterm-redraw'), so it can never pair with a manual
+              ;; C-l into the `/clear' double-press.
               (run-at-time 0.3 nil
-                           (lambda (p)
-                             (when (and (processp p) (process-live-p p))
-                               (process-send-string p "\C-l")))
-                           proc)))))
+                           (lambda (b)
+                             (when (buffer-live-p b)
+                               (with-current-buffer b
+                                 (my/claude-vterm-redraw))))
+                           buffer)))))
     (funcall orig-fn buffer window)))
 
 (with-eval-after-load 'claude-code-ide
   (advice-add 'claude-code-ide--sync-terminal-dimensions
               :around #'my/claude-sync-terminal-dims-fix))
+
+;; --- Terminal backend: ghostel (libghostty) in place of vterm ---
+;;
+;; ghostel.el drives libghostty-vt, the VT engine behind Ghostty, as a native
+;; module.  Three of its capabilities replace hand-written workarounds above:
+;;
+;;   * DEC 2026 SYNCHRONIZED OUTPUT, which libvterm does not implement.  Claude's
+;;     Ink TUI brackets each frame in 2026 begin/end, so a terminal honoring it
+;;     never paints a half-finished frame -- the whole class of bug that
+;;     `my/claude-vterm-sync-size' and the C-l repaint dance clean up after.
+;;     ghostel also cannot hit the grid-vs-PTY desync at all: for this backend
+;;     `claude-code-ide--sync-terminal-dimensions' calls BOTH
+;;     `ghostel--window-adjust-process-window-size' (the grid) and
+;;     `set-process-window-size' (the child), and claude-code-ide leaves its own
+;;     #1422 reflow filter disabled for ghostel.
+;;
+;;   * NATIVE SGR MOUSE FORWARDING.  When a TUI enables DEC mouse tracking (Claude
+;;     does), ghostel forwards wheel and click events to the program, so nothing
+;;     like `my/vterm-wheel-scroll' is needed.
+;;
+;;   * SCROLLBACK MATERIALIZED INTO THE BUFFER (`ghostel-max-scrollback', 5 MB),
+;;     plus copy mode (`C-c C-t'), copy-everything (`C-c M-w'), and automatic
+;;     freezing when a command activates the mark or moves point off the live
+;;     cursor (`ghostel-mark-activation-input-mode',
+;;     `ghostel-point-leave-input-mode').  So isearch / swiper / region kill work
+;;     over history with no transcript export.
+;;     CAVEAT: in Claude's `/tui fullscreen' renderer the conversation lives on
+;;     the ALTERNATE screen, so no terminal populates scrollback there.  Run
+;;     `my/claude-toggle-tui' to put Claude in inline mode if you want the
+;;     conversation in the buffer.
+;;
+;; Everything vterm-specific above stays installed but goes INERT: those hooks
+;; run on `vterm-mode-hook', those keys live in `vterm-mode-map', and
+;; `my/claude-sync-terminal-dims-fix' already guards on the backend being
+;; `vterm'.  Setting `claude-code-ide-terminal-backend' back to `vterm' restores
+;; the previous setup with no other edit.
+(use-package ghostel
+  :ensure t
+  :custom
+  ;; Keep the native module OUT of the package tree.  A MELPA upgrade rewrites
+  ;; elpa/ghostel-*/ and would delete the loaded module out from under a
+  ;; long-lived daemon; a stable path survives upgrades.
+  (ghostel-module-directory (expand-file-name "ghostel/" user-emacs-directory))
+  :config
+  (unless (file-directory-p ghostel-module-directory)
+    (make-directory ghostel-module-directory t))
+  ;; tmux-style `C-c [' for copy mode, matching the vterm binding above.
+  ;; `ghostel-mode-map' is the base map every input mode inherits (semi-char via
+  ;; `set-keymap-parent' in `ghostel--rebuild-semi-char-keymap', copy/Emacs via
+  ;; `ghostel-readonly-mode-map's `:parent'), and `ghostel-copy-mode' is itself a
+  ;; toggle -- so one binding here works in both directions from every mode.
+  ;; ghostel's own `C-c C-t' keeps working.
+  (define-key ghostel-mode-map (kbd "C-c [") #'ghostel-copy-mode))
 
 (use-package eat
   :ensure t)
@@ -1120,7 +1287,10 @@ so the grid and Claude agree at open; then schedule one clean redraw."
   :bind (("C-c C-'" . claude-code-ide-menu)
          ("M-i"     . my/claude-add-region-or-tab))
   :custom
-  (claude-code-ide-terminal-backend 'vterm)
+  ;; ghostel, not vterm: see the `use-package ghostel' commentary above for why
+  ;; (synchronized output, native mouse forwarding, buffer-materialized
+  ;; scrollback).  Revert to 'vterm to get the old setup back verbatim.
+  (claude-code-ide-terminal-backend 'ghostel)
   (claude-code-ide-window-side 'right)
   ;; Turn OFF claude-code-ide's bug-#1422 reflow workaround.  It resizes
   ;; libvterm's grid on a height-only change but withholds the new size from
