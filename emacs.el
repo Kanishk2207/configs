@@ -12,10 +12,11 @@
 ;;   4.  Frames & appearance (daemon-safe: runs per-frame)
 ;;   5.  Scrolling
 ;;   6.  Editing, utilities & global keybindings
-;;   7.  Completion (Corfu + Orderless + Swiper)
+;;   7.  Completion (Corfu + Orderless + yasnippet + Swiper)
 ;;   8.  Windows, Dired, Ediff, Magit, Projectile, Flycheck
 ;;   9.  Whitespace & TODO highlighting
-;;   10. LSP core (lsp-mode, lsp-ui, navigation keys)
+;;   10. LSP core (lsp-mode, lsp-ui, consult-lsp, navigation keys)
+;;   10c. Debugging (dape / Debug Adapter Protocol)
 ;;   11. Languages: Python, Go, Rust, Clojure, Elixir, TS/JS, Terraform/HCL
 ;;   12. Theme (always last)
 ;;
@@ -288,6 +289,21 @@ Safe for both GUI and terminal frames: GUI-only tweaks are guarded."
   (completion-category-overrides '((file (styles partial-completion))
                                    (lsp-capf (styles orderless)))))
 
+;; Snippet engine.  Installed for one specific reason: lsp-mode only
+;; advertises snippet support to a server when yasnippet is present
+;; (`lsp-enable-snippet', section 10).  Without it gopls silently stops
+;; sending parameter placeholders and completing a call gives you a bare
+;; identifier instead of a filled-in argument list.
+;;
+;; Deliberately no `yasnippet-snippets' library: with an empty snippet
+;; table nothing competes for TAB, and everything that matters here comes
+;; from the language server rather than from hand-written templates.
+(use-package yasnippet
+  :ensure t
+  :diminish yas-minor-mode
+  :init
+  (yas-global-mode 1))
+
 (use-package swiper
   :ensure t
   :bind (("C-s"     . swiper)
@@ -389,14 +405,49 @@ Safe for both GUI and terminal frames: GUI-only tweaks are guarded."
 ;; 10. LSP core
 ;; ============================================================
 
+;; Prelude's language modules all call `prelude-lsp-enable', and
+;; `prelude-lsp-client' defaults to `eglot' (see core/prelude-custom.el).
+;; So every Go / Python / JS buffer was starting eglot *in addition to*
+;; the lsp-mode client hooked below: two language servers on the same
+;; project, two diagnostics backends (that is the `Flymake[..]' next to
+;; `FlyC:..' in the modeline), two completion-at-point stacks and two
+;; format-on-save paths.  nil makes `prelude-lsp-enable' a no-op, so this
+;; file owns LSP outright.
+(setq prelude-lsp-client nil)
+
 (use-package lsp-mode
   :ensure t
   :init
   ;; Corfu + completion-at-point-functions setup
   ;; (avoids company-mode autoconfig warnings).
   (setq lsp-completion-provider :capf)
-  ;; Silence snippet warning when yasnippet isn't installed.
-  (setq lsp-enable-snippet nil)
+  ;; Snippet completion.  gopls only sends parameter placeholders
+  ;; (`lsp-go-use-placeholders' and `lsp-go-complete-function-calls', both
+  ;; t by default) when the client advertises snippet support, and that
+  ;; needs yasnippet -- installed in section 7.  This is the difference
+  ;; between completing `fmt.Println' and completing `fmt.Println(a ...any)'
+  ;; with point already in the argument slot.
+  (setq lsp-enable-snippet t)
+  ;; Prefix for lsp-mode's whole command map (see the GoLand key table
+  ;; further down).  The default is `s-l', i.e. Cmd-l, which a terminal
+  ;; frame cannot deliver at all.  `C-c L' works in GUI and tty and steps
+  ;; on nothing: `C-c l' is org-store-link, `C-c C-l' is cider-load-file.
+  (setq lsp-keymap-prefix "C-c L")
+  ;; Inlay hints: parameter names and inferred types drawn inline, the way
+  ;; GoLand does.  This variable is the supported switch -- lsp-mode reads
+  ;; it in `lsp-configure-buffer' and turns `lsp-inlay-hints-mode' on
+  ;; itself, but only once the workspace is up and the server has actually
+  ;; advertised textDocument/inlayHint.
+  ;;
+  ;; Do NOT put `lsp-inlay-hints-mode' in a use-package `:hook' instead.
+  ;; That function carries no autoload cookie, so at the time this file is
+  ;; read it is not yet fbound, and use-package responds by generating
+  ;; `(autoload (quote lsp-inlay-hints-mode) "go-ts-mode")' -- an autoload
+  ;; pointing at a file that does not define it.  Opening a Go buffer then
+  ;; fails with "Autoloading file .../go-ts-mode.elc failed to define
+  ;; function lsp-inlay-hints-mode".  A mode hook is also simply too early:
+  ;; it runs before the server is connected.
+  (setq lsp-inlay-hint-enable t)
   ;; Semantic highlighting from the language server: colors functions,
   ;; macros, keywords, locals, and definitions that the tree-sitter grammar
   ;; can't distinguish on its own.  Biggest visual win for Clojure; also
@@ -419,8 +470,42 @@ Safe for both GUI and terminal frames: GUI-only tweaks are guarded."
   :custom
   (lsp-ui-sideline-enable nil)
   (lsp-ui-doc-enable nil)
+  ;; Always open the peek list, even when the server returns exactly one
+  ;; result.  Without this lsp-ui silently jumps instead, so a lone
+  ;; implementation behaves differently from two -- and you lose the one
+  ;; view that shows you it IS the only one.  Applies to every peek
+  ;; command: M-o (implementations), M-? (references) and C-c L G g
+  ;; (definitions).
+  (lsp-ui-peek-always-show t)
   :hook
   (lsp-mode . lsp-ui-mode))
+
+;; Workspace symbol search, file structure and a project-wide problems
+;; list, all through the vertico/consult UI already in use here.  These
+;; are GoLand's "Search Everywhere for symbols", "File Structure" and
+;; "Problems" views.  lsp-mode also routes `xref-find-apropos' at
+;; `C-c L g a' to workspace symbols; consult-lsp gives live narrowing.
+(use-package consult-lsp
+  :ensure t
+  :after (lsp-mode consult))
+
+;; lsp-treemacs supplies the two hierarchy views lsp-mode has entries for
+;; but cannot draw on its own.  With this installed, `C-c L g h' becomes
+;; GoLand's call hierarchy (Ctrl+Alt+H), `C-c L g y' its type hierarchy
+;; (Ctrl+H) and `C-c L g e' its problems list.
+;;
+;; Autoloaded only.  It drags in treemacs, so it is left to load on first
+;; use rather than at lsp-mode load time; `lsp-treemacs-sync-mode' is
+;; deliberately off, since file navigation here goes through projectile
+;; and dired, not a treemacs sidebar.
+(use-package lsp-treemacs
+  :ensure t
+  :commands (lsp-treemacs-call-hierarchy
+             lsp-treemacs-type-hierarchy
+             lsp-treemacs-errors-list
+             lsp-treemacs-symbols
+             lsp-treemacs-references
+             lsp-treemacs-implementations))
 
 ;; Generic helper: format via LSP before saving (buffer-local hook).
 (defun lsp-format-buffer-on-save ()
@@ -437,6 +522,35 @@ Safe for both GUI and terminal frames: GUI-only tweaks are guarded."
           (ignore-errors
             (lsp-semantic-tokens-refresh))))))
   (advice-add 'load-theme :after #'my/lsp-refresh-semantic-tokens-after-theme))
+
+;; --- Inlay hint colour ------------------------------------------------
+;;
+;; lsp-mode ships `lsp-inlay-hint-face' inheriting `font-lock-comment-face'.
+;; Under doom-dark+ that resolves to green (#579C4C), so hints read as
+;; comments rather than as editor chrome.  GoLand and VS Code both draw
+;; them in a neutral dim grey; #969696 is literally VS Code Dark+'s
+;; `editorInlayHint.foreground', which pairs with the #1e1e1e background
+;; this theme already uses.
+;;
+;; `lsp-inlay-hint-type-face' and `lsp-inlay-hint-parameter-face' both
+;; inherit the base face, so setting the base covers both.  The explicit
+;; `unspecified' inherit is what detaches it from the comment face.
+;;
+;; Re-applied after `load-theme' because loading a theme re-evaluates face
+;; specs and would otherwise put the comment colour back.
+(defun my/lsp-style-inlay-hints (&rest _)
+  "Draw LSP inlay hints in a dim grey, the way GoLand and VS Code do."
+  (when (facep 'lsp-inlay-hint-face)
+    (set-face-attribute 'lsp-inlay-hint-face nil
+                        :inherit 'unspecified
+                        :foreground "#969696"
+                        :background 'unspecified
+                        :slant 'normal
+                        :weight 'normal)))
+
+(with-eval-after-load 'lsp-mode
+  (my/lsp-style-inlay-hints))
+(advice-add 'load-theme :after #'my/lsp-style-inlay-hints)
 
 ;; Language IDs for tree-sitter modes lsp-mode doesn't know yet.
 (with-eval-after-load 'lsp-mode
@@ -504,6 +618,435 @@ Uses lsp-mode's own display-action (`window' = other window) and forces
 (with-eval-after-load 'lsp-ui-peek
   (define-key lsp-ui-peek-mode-map (kbd "C-<return>")
               #'my/lsp-ui-peek-goto-xref-vsplit))
+
+;; --- GoLand navigation parity ---
+;;
+;; `lsp-keymap-prefix' is `C-c L' (set in the lsp-mode block above), which
+;; exposes lsp-mode's entire command map with which-key annotating every
+;; leaf.  Everything GoLand does over LSP is already in there; the map
+;; below is the translation, plus three short keys for the operations that
+;; get used every few minutes.
+;;
+;;   GoLand                              here
+;;   ---------------------------------   -----------------------------------
+;;   Ctrl+B         declaration          M-.     / C-c L g g
+;;   Ctrl+Alt+B     implementations      M-o     / C-c L G i   (peek list)
+;;                  ... jump straight    M-O     / C-c L g i
+;;   Ctrl+Shift+B   type declaration     C-c L g t
+;;   Alt+F7         find usages          M-?     / C-c L g r
+;;   Ctrl+Alt+Shift+N  symbol in project C-c L g a   (or M-x consult-lsp-symbols)
+;;   Ctrl+Alt+H     call hierarchy       C-c L g h
+;;   Ctrl+H         type hierarchy       C-c L g y
+;;   Ctrl+F12       file structure       M-x consult-lsp-file-symbols
+;;   Alt+Enter      quick fix / refactor M-RET   / C-c L a a
+;;   Shift+F6       rename               C-c L r r
+;;   Ctrl+Q         quick documentation  C-c L h g
+;;   Ctrl+P         parameter info       C-c L h s
+;;   Problems view                       C-c L g e   (or consult-lsp-diagnostics)
+;;   Code Vision: N usages / N impls     C-c L g u   (on demand, see below)
+;;                ... as a live lens     C-c L T u   (toggle, off by default)
+;;   Optimize imports                    C-c L r o
+;;   Reformat                            C-c L = =
+;;   Toggle sideline/doc/hints/lenses    C-c L T ...
+;;
+;; The one worth internalising for Go: gopls implements
+;; textDocument/implementation in BOTH directions.  With point on an
+;; interface, or on a method inside an interface, `M-o' lists every
+;; concrete type (or method) that satisfies it.  With point on a concrete
+;; method, the same key lists the interfaces that method satisfies -- that
+;; is GoLand's "Go to Super Method" (Ctrl+U) and its interface gutter
+;; arrow, from one keystroke.  It works across the whole module, including
+;; dependencies, because gopls indexes them.
+(with-eval-after-load 'lsp-mode
+  ;; Type hierarchy has no slot in lsp-mode's stock command map; give it
+  ;; one next to the call hierarchy under `g'.
+  (when (boundp 'lsp-command-map)
+    (define-key lsp-command-map (kbd "g y") #'lsp-treemacs-type-hierarchy))
+
+  ;; Short keys, chosen to survive a terminal frame (no super, and no C-i
+  ;; which a tty cannot tell apart from TAB).  `M-i' is deliberately left
+  ;; free: it is the "give context to the model" key in claude-code-ide
+  ;; and the ACP agent-shell integration.
+  ;;
+  ;; `M-o' is `crux-smart-open-line' in prelude-mode-map.  Both are
+  ;; minor-mode maps, so which one wins comes down to their order in
+  ;; `minor-mode-map-alist' -- the same precedence problem the vterm
+  ;; section below works around.  Rather than rely on lsp-mode having
+  ;; loaded after prelude, hoist its entry to the front explicitly.  That
+  ;; also protects M-. / M-? / M-, / M-RET in every LSP buffer.  crux keeps
+  ;; M-o everywhere LSP is not running.
+  (define-key lsp-mode-map (kbd "M-RET") #'lsp-execute-code-action)
+  ;; M-o always opens the peek list, even for a single implementation --
+  ;; that is `lsp-ui-peek-always-show' in the lsp-ui block above.  M-O is
+  ;; the direct jump, for when you already know there is only one.
+  (define-key lsp-mode-map (kbd "M-O")   #'lsp-find-implementation)
+  (with-eval-after-load 'lsp-ui-peek
+    (define-key lsp-mode-map (kbd "M-o") #'lsp-ui-peek-find-implementation))
+
+  (let ((entry (assq 'lsp-mode minor-mode-map-alist)))
+    (when entry
+      (setq minor-mode-map-alist
+            (cons entry (delq entry minor-mode-map-alist))))))
+
+;; --- Usage and implementation counts (GoLand's Code Vision) -----------
+;;
+;; gopls does not provide these.  Verified against the installed binary
+;; with `gopls api-json': it publishes exactly eight code lenses --
+;; generate, regenerate_cgo, test, run_govulncheck, tidy,
+;; upgrade_dependency, vendor, vulncheck -- and not one is a usage count.
+;;
+;; GoLand's "3 usages / 2 implementations" above a declaration is IntelliJ
+;; Code Vision, answered instantly from a persistent whole-project index.
+;; gopls has no such index; it resolves references by searching the
+;; workspace per query, which is why upstream never turned counts into
+;; lenses.  So they have to be asked for from this side: one
+;; textDocument/references plus one textDocument/implementation per
+;; declaration, each a workspace-wide search on the server.
+;;
+;; Entry points:
+;;
+;;   M-x my/lsp-usage-lens-global-mode   one switch for every buffer
+;;   C-c L T u                           the same toggle
+;;   C-c L g u                           one-shot count for the symbol at point
+;;
+;; "Project-wide" can only ever mean "every buffer I open": an overlay
+;; needs a buffer, and files that are not visited have nothing to draw on.
+;; The global mode is therefore a globalized minor mode -- flip it once and
+;; every LSP buffer, present and future, carries lenses until you flip it
+;; back.
+;;
+;; How much each buffer shows is `my/lsp-usage-lens-scope', because the
+;; cost is per declaration, not per project:
+;;
+;;   at-point  only the declaration point is inside.  Two requests per
+;;             declaration you visit.  Effectively free.
+;;   window    every declaration currently on screen.  Two requests each,
+;;             capped by `my/lsp-usage-lens-max'.  This is what GoLand
+;;             looks like, and it is the one that can make gopls feel slow:
+;;             completion and diagnostics queue behind these searches.
+
+(defcustom my/lsp-usage-lens-scope 'at-point
+  "How much of the buffer `my/lsp-usage-lens-mode' annotates.
+`at-point' covers only the declaration containing point.  `window'
+covers every declaration currently visible, which looks like GoLand but
+costs two language-server searches per declaration."
+  :type '(choice (const :tag "Declaration at point" at-point)
+                 (const :tag "Everything on screen" window))
+  :group 'lsp-mode)
+
+(defcustom my/lsp-usage-lens-max 25
+  "Most declarations to annotate in one pass when scope is `window'.
+A backstop against a screenful of small functions turning into a burst of
+workspace searches.  Truncation is reported, never silent."
+  :type 'integer
+  :group 'lsp-mode)
+
+(defcustom my/lsp-usage-lens-idle 0.6
+  "Idle seconds before the usage lens refreshes."
+  :type 'number
+  :group 'lsp-mode)
+
+(defvar my/lsp-usage-lens--timer nil
+  "Shared idle timer driving `my/lsp-usage-lens-mode' in every buffer.")
+
+(defvar-local my/lsp-usage-lens--overlays nil
+  "Alist of (DECLARATION-START . OVERLAY) for this buffer.")
+
+(defvar-local my/lsp-usage-lens--wanted nil
+  "Declaration start positions that should currently carry a lens.")
+
+(defvar-local my/lsp-usage-lens--tick nil
+  "Value of `buffer-chars-modified-tick' when the lenses were drawn.")
+
+(defun my/lsp--count-locations (res)
+  "Count the locations in RES.
+A references or implementation response is either a collection of
+Locations or a single one, and how each is represented depends on
+`lsp-use-plists' -- nil here, so objects arrive as hash tables.  Test the
+SINGLE-object shapes first, then treat anything else sequence-like as a
+collection.
+
+Getting this wrong is not hypothetical.  An earlier version asked
+\(consp (car res)) to decide whether RES was a list of objects.  A list of
+hash tables fails that test, so every non-empty answer fell through to the
+single-object branch and reported 1: `serverOnlyFlag' in prometheus, with
+31 real references, displayed \"1 usage\".  Zero-reference symbols looked
+correct, which is what let it pass unnoticed."
+  (cond ((null res) 0)
+        ;; One Location, as a hash table (lsp-use-plists nil) ...
+        ((hash-table-p res) 1)
+        ;; ... or as a plist (lsp-use-plists t).
+        ((and (consp res) (keywordp (car res))) 1)
+        ;; Otherwise a vector or list of Location objects.
+        ((sequencep res) (length res))
+        (t 1)))
+
+(defun my/lsp-usage-counts ()
+  "Echo the reference and implementation counts for the symbol at point.
+
+Usages EXCLUDE the declaration itself, matching what GoLand counts.  This
+is deliberately one less than the peek window on `M-?' reports:
+`lsp-ui-peek-find-references' passes nil into the `exclude-declaration'
+slot of `lsp--make-reference-params', so its header counts the declaration
+line as a reference.  31 usages there means 32 references.
+
+The implementation clause is omitted rather than reported as zero when the
+server refuses the query -- gopls answers \"X is a function, not a method\"
+for a plain function, and printing \"0 implementations\" for that would be
+a claim, not an absence."
+  (interactive)
+  (unless (bound-and-true-p lsp-mode)
+    (user-error "No LSP session in this buffer"))
+  (let ((sym (or (thing-at-point 'symbol t) "symbol"))
+        (refs :pending)
+        (impls :pending))
+    (cl-labels
+        ((report ()
+           (unless (or (eq refs :pending) (eq impls :pending))
+             ;; nil impls means "not applicable"; 0 is a real answer.
+             (message "%s: %d usage%s%s"
+                      sym
+                      refs (if (eql refs 1) "" "s")
+                      (if impls
+                          (format ", %d implementation%s"
+                                  impls (if (eql impls 1) "" "s"))
+                        "")))))
+      (lsp-request-async
+       "textDocument/references" (lsp--make-reference-params nil t)
+       (lambda (res) (setq refs (my/lsp--count-locations res)) (report))
+       :mode 'alive
+       :error-handler (lambda (_) (setq refs 0) (report)))
+      (lsp-request-async
+       "textDocument/implementation" (lsp--text-document-position-params)
+       (lambda (res) (setq impls (my/lsp--count-locations res)) (report))
+       :mode 'alive
+       :error-handler (lambda (_) (setq impls nil) (report))))))
+
+(defun my/lsp-usage-lens--name-node (node)
+  "Return the identifier node that names declaration NODE.
+References resolve against the name, not the `func' or `type' keyword, so
+the request has to be issued from the identifier's position."
+  (or (treesit-node-child-by-field-name node "name")
+      ;; A Go `type_declaration' wraps its name one level down, in a
+      ;; `type_spec'.
+      (let ((spec (treesit-search-subtree node "\\`type_spec\\'" nil nil 2)))
+        (and spec (treesit-node-child-by-field-name spec "name")))))
+
+(defun my/lsp-usage-lens--clear ()
+  "Delete every lens overlay in this buffer."
+  (dolist (cell my/lsp-usage-lens--overlays)
+    (when (overlayp (cdr cell)) (delete-overlay (cdr cell))))
+  (setq my/lsp-usage-lens--overlays nil
+        my/lsp-usage-lens--wanted nil
+        my/lsp-usage-lens--tick nil))
+
+(defun my/lsp-usage-lens--wants-impls-p (node)
+  "Non-nil when asking gopls for implementations of NODE is meaningful.
+gopls rejects textDocument/implementation on a plain function -- it
+answers \"X is a function, not a method\" -- so a `function_declaration'
+carries the usage count alone.  Methods and named types are the two kinds
+where interface satisfaction is an actual question.  Skipping the request
+also halves the traffic for plain functions, which are the majority."
+  (member (treesit-node-type node)
+          '("method_declaration" "type_declaration" "type_spec")))
+
+(defun my/lsp-usage-lens--draw (decl-pos refs impls)
+  "Draw the lens for the declaration starting at DECL-POS.
+IMPLS of nil omits the implementation clause, which is how \"the server
+would not answer that\" is distinguished from a genuine zero."
+  (save-excursion
+    (goto-char decl-pos)
+    (let* ((bol (line-beginning-position))
+           (indent (buffer-substring-no-properties
+                    bol (save-excursion (back-to-indentation) (point))))
+           (text (format "%d usage%s%s"
+                         refs (if (eql refs 1) "" "s")
+                         (if impls
+                             (format ", %d implementation%s"
+                                     impls (if (eql impls 1) "" "s"))
+                           "")))
+           (ov (make-overlay bol bol nil t nil)))
+      ;; A `before-string' ending in a newline renders on its own line
+      ;; above the declaration, which is how lsp-lens draws its own lenses
+      ;; and how GoLand places Code Vision.
+      (overlay-put ov 'before-string
+                   (concat indent
+                           (propertize text 'face 'lsp-inlay-hint-face)
+                           "\n"))
+      (push (cons decl-pos ov) my/lsp-usage-lens--overlays))))
+
+(defun my/lsp-usage-lens--request (name-pos decl-pos want-impls)
+  "Ask for counts at NAME-POS and draw them above DECL-POS.
+When WANT-IMPLS is nil the implementation request is not sent at all and
+the clause is omitted; see `my/lsp-usage-lens--wants-impls-p'."
+  (let ((buf (current-buffer))
+        (refs :pending)
+        ;; nil rather than `:pending' means render can proceed on refs alone.
+        (impls (if want-impls :pending nil)))
+    (cl-labels
+        ((render ()
+           (unless (or (eq refs :pending) (eq impls :pending))
+             (when (buffer-live-p buf)
+               (with-current-buffer buf
+                 ;; Point may have moved, or the buffer been edited, while
+                 ;; these were in flight.  Only draw if this declaration is
+                 ;; still wanted and not already drawn.
+                 (when (and (memql decl-pos my/lsp-usage-lens--wanted)
+                            (not (assq decl-pos my/lsp-usage-lens--overlays)))
+                   (my/lsp-usage-lens--draw decl-pos refs impls)))))))
+      (save-excursion
+        (goto-char name-pos)
+        (lsp-request-async
+         "textDocument/references" (lsp--make-reference-params nil t)
+         (lambda (res) (setq refs (my/lsp--count-locations res)) (render))
+         :mode 'alive
+         :error-handler (lambda (_) (setq refs 0) (render)))
+        (when want-impls
+          (lsp-request-async
+           "textDocument/implementation" (lsp--text-document-position-params)
+           (lambda (res) (setq impls (my/lsp--count-locations res)) (render))
+           :mode 'alive
+           ;; nil, not 0: the server declining the question is not an answer.
+           :error-handler (lambda (_) (setq impls nil) (render))))))))
+
+(defun my/lsp-usage-lens--targets ()
+  "Declaration nodes that should carry a lens right now.
+Honours `my/lsp-usage-lens-scope'.
+
+For `window', the test is on each declaration's OWN START position, not
+on whether its body overlaps the viewport.  A 200-line function scrolled
+so only its middle is visible has nothing to annotate: the lens draws
+above the signature line, which is off screen, so an overlapping-body
+test would fire two workspace searches to render something invisible.
+The declaration containing point is unioned in regardless, which is what
+covers exactly that case -- deep inside a long function you still get its
+counts, just not the ones you cannot see."
+  (pcase my/lsp-usage-lens-scope
+    ('window
+     (let* ((beg (window-start))
+            (end (window-end nil t))
+            (rx  (or treesit-defun-type-regexp ""))
+            (here (treesit-defun-at-point))
+            (hits '()))
+       (dolist (child (treesit-node-children (treesit-buffer-root-node) t))
+         (let ((start (treesit-node-start child)))
+           (when (and (stringp (treesit-node-type child))
+                      (string-match-p rx (treesit-node-type child))
+                      (>= start beg)
+                      (<= start end))
+             (push child hits))))
+       (setq hits (nreverse hits))
+       ;; Union in the enclosing declaration when its signature is above
+       ;; the viewport.
+       (if (and here (not (memql (treesit-node-start here)
+                                 (mapcar #'treesit-node-start hits))))
+           (cons here hits)
+         hits)))
+    (_ (let ((node (treesit-defun-at-point)))
+         (and node (list node))))))
+
+(defun my/lsp-usage-lens--update ()
+  "Refresh this buffer's usage lenses if what should be shown has changed."
+  ;; Demoted rather than raw: an error raised inside an idle timer repeats
+  ;; on every tick and is close to unusable.
+  (with-demoted-errors "usage lens: %S"
+    (when (and (bound-and-true-p my/lsp-usage-lens-mode)
+               (bound-and-true-p lsp-mode)
+               (not (minibufferp))
+               (fboundp 'treesit-defun-at-point)
+               (treesit-parser-list))
+      ;; Any edit invalidates both the positions and the counts.
+      (unless (eql my/lsp-usage-lens--tick (buffer-chars-modified-tick))
+        (my/lsp-usage-lens--clear)
+        (setq my/lsp-usage-lens--tick (buffer-chars-modified-tick)))
+      (let* ((all (my/lsp-usage-lens--targets))
+             (nodes (seq-take all my/lsp-usage-lens-max)))
+        (when (> (length all) (length nodes))
+          ;; Never truncate silently.
+          (message "usage lens: showing %d of %d declarations on screen (see `my/lsp-usage-lens-max')"
+                   (length nodes) (length all)))
+        (setq my/lsp-usage-lens--wanted
+              (mapcar #'treesit-node-start nodes))
+        ;; Drop overlays for declarations that scrolled out of scope.
+        (dolist (cell (copy-sequence my/lsp-usage-lens--overlays))
+          (unless (memql (car cell) my/lsp-usage-lens--wanted)
+            (when (overlayp (cdr cell)) (delete-overlay (cdr cell)))
+            (setq my/lsp-usage-lens--overlays
+                  (delq cell my/lsp-usage-lens--overlays))))
+        ;; Request only what is missing, so re-running is idempotent.
+        (dolist (node nodes)
+          (let ((start (treesit-node-start node))
+                (name  (my/lsp-usage-lens--name-node node)))
+            (when (and name (not (assq start my/lsp-usage-lens--overlays)))
+              (my/lsp-usage-lens--request
+               (treesit-node-start name) start
+               (my/lsp-usage-lens--wants-impls-p node)))))))))
+
+(define-minor-mode my/lsp-usage-lens-mode
+  "Show usage and implementation counts above Go declarations.
+Scope is controlled by `my/lsp-usage-lens-scope'.  Prefer
+`my/lsp-usage-lens-global-mode' as the switch; this is the per-buffer
+mode it drives."
+  :lighter " Uses"
+  (if my/lsp-usage-lens-mode
+      (progn
+        (unless my/lsp-usage-lens--timer
+          (setq my/lsp-usage-lens--timer
+                (run-with-idle-timer my/lsp-usage-lens-idle t
+                                     #'my/lsp-usage-lens--update)))
+        (add-hook 'change-major-mode-hook #'my/lsp-usage-lens--clear nil t))
+    (my/lsp-usage-lens--clear)
+    (remove-hook 'change-major-mode-hook #'my/lsp-usage-lens--clear t)))
+
+(defun my/lsp-usage-lens--turn-on ()
+  "Enable `my/lsp-usage-lens-mode' where it can do something useful.
+Buffers without a tree-sitter parser have no declarations to anchor to;
+`lsp-mode' is not checked here because it usually starts after the major
+mode does -- `my/lsp-usage-lens--update' rechecks it on every tick."
+  (when (and (derived-mode-p 'prog-mode)
+             (fboundp 'treesit-parser-list)
+             (treesit-parser-list))
+    (my/lsp-usage-lens-mode 1)))
+
+;;;###autoload
+(define-globalized-minor-mode my/lsp-usage-lens-global-mode
+  my/lsp-usage-lens-mode
+  my/lsp-usage-lens--turn-on
+  :group 'lsp-mode)
+
+(defun my/lsp-usage-lens-set-scope (scope)
+  "Set `my/lsp-usage-lens-scope' to SCOPE and redraw every lens buffer.
+`at-point' annotates only the declaration containing point: two
+language-server searches per declaration you visit, effectively free.
+`window' annotates every declaration whose signature is on screen, plus
+the one containing point: two searches each, capped by
+`my/lsp-usage-lens-max'."
+  (interactive
+   (list (intern
+          (completing-read
+           (format "Usage lens scope (currently %s): "
+                   my/lsp-usage-lens-scope)
+           '("at-point" "window")
+           nil t nil nil (symbol-name my/lsp-usage-lens-scope)))))
+  (setq my/lsp-usage-lens-scope scope)
+  ;; Existing overlays were drawn under the old scope; drop them all so the
+  ;; next idle tick rebuilds from scratch rather than leaving orphans.
+  (dolist (buf (buffer-list))
+    (with-current-buffer buf
+      (when (bound-and-true-p my/lsp-usage-lens-mode)
+        (my/lsp-usage-lens--clear))))
+  (my/lsp-usage-lens--update)
+  (message "Usage lens scope: %s%s" scope
+           (if (eq scope 'window)
+               (format " (up to %d declarations per screen)"
+                       my/lsp-usage-lens-max)
+             "")))
+
+(with-eval-after-load 'lsp-mode
+  (when (boundp 'lsp-command-map)
+    (define-key lsp-command-map (kbd "g u") #'my/lsp-usage-counts)
+    (define-key lsp-command-map (kbd "T u") #'my/lsp-usage-lens-global-mode)
+    (define-key lsp-command-map (kbd "T U") #'my/lsp-usage-lens-set-scope)))
 
 ;; ============================================================
 ;; Claude Code (claude-code-ide.el over MCP)
@@ -2232,6 +2775,74 @@ Targets a live agent-shell if there is one, else a claude-code-ide session."
 (global-set-key (kbd "C-c C-;") my/agent-shell-map)
 
 ;; ============================================================
+;; 10c. Debugging (Debug Adapter Protocol via dape)
+;; ============================================================
+;;
+;; This is the one capability GoLand had that had no counterpart here at
+;; all.  dape speaks the Debug Adapter Protocol, the debugging equivalent
+;; of LSP, and ships a ready-made Delve configuration for `go-mode' and
+;; `go-ts-mode' -- so `M-x dape' offers Go entries with no per-project
+;; setup.  It also covers Python (debugpy) and Rust (codelldb) if those
+;; adapters are installed later.
+;;
+;; Requires `dlv' on PATH (installed).  Everything hangs off dape's own
+;; prefix, `C-x C-a', which is free here and works in a terminal frame
+;; (`C-c d' is not usable: prelude-mode-map binds it to
+;; `crux-duplicate-current-line-or-region', and a minor-mode map outranks
+;; the global map).  Typical loop:
+;;
+;;   C-x C-a b   toggle a breakpoint on this line
+;;   C-x C-a d   start a session, then pick `dlv' or `dlv-test'
+;;   C-x C-a n / s / o   step over / into / out
+;;   C-x C-a c   continue
+;;   C-x C-a i   info buffers: scopes, watch, stack, breakpoints, threads
+;;   C-x C-a x   evaluate an expression in the stopped frame
+;;   C-x C-a w   watch the thing at point
+;;   C-x C-a e   conditional breakpoint (an expression that must hold)
+;;   C-x C-a h   hit-count breakpoint
+;;   C-x C-a R   repl
+;;   C-x C-a q   quit the session
+;;
+;; `dape-info' is the closest equivalent to GoLand's debugger panel, and
+;; `dape-select-thread' switches goroutines.
+(use-package dape
+  :ensure t
+  :init
+  ;; Side-by-side panels rather than stacked, matching how magit and lsp
+  ;; definitions are set up elsewhere in this file.
+  (setq dape-buffer-window-arrangement 'right)
+  :custom
+  ;; Annotate the code with live variable values while stopped, the way
+  ;; GoLand does during a debug session.  (This is dape's default; stated
+  ;; explicitly because it is one of the things being matched.)
+  (dape-inlay-hints t)
+  :config
+  ;; Keep the compile buffer from lingering once the build succeeds.
+  (add-hook 'dape-compile-hook #'kill-buffer)
+  ;; Clickable breakpoint controls in the fringe, in every prog-mode
+  ;; buffer rather than only during a session.
+  (dape-breakpoint-global-mode 1)
+
+  ;; dape ships a `dlv' entry (modes go-mode and go-ts-mode) that launches
+  ;; the package in the current directory.  It has no test counterpart, so
+  ;; add one: `:mode "test"' is how the Delve DAP adapter is told to build
+  ;; and run the package's tests.  This is GoLand's "Debug test".
+  (add-to-list 'dape-configs
+               '(dlv-test
+                 modes (go-mode go-ts-mode)
+                 ensure dape-ensure-command
+                 command "dlv"
+                 command-args ("dap" "--listen" "127.0.0.1::autoport")
+                 command-cwd (file-name-directory (buffer-file-name))
+                 command-insert-stderr t
+                 port :autoport
+                 :request "launch"
+                 :type "go"
+                 :mode "test"
+                 :cwd "."
+                 :program ".")))
+
+;; ============================================================
 ;; 11a. Python (Pyright + Ruff)
 ;; TODO: add venv restart along with lsp restart on project switch
 ;; ============================================================
@@ -2319,20 +2930,89 @@ Targets a live agent-shell if there is one, else a claude-code-ide session."
 ;; 11b. Go (gopls)
 ;; ============================================================
 
+;; --- Formatting on save: gofumpt + goimports, both through gopls ------
+;;
+;; gopls performs both jobs itself, so neither binary is spawned per save:
+;;
+;;   * `lsp-go-use-gofumpt' makes textDocument/formatting apply gofumpt's
+;;     rules.  gofumpt is linked into gopls as a library.
+;;   * source.organizeImports IS the goimports engine
+;;     (golang.org/x/tools/internal/imports) driven over LSP.  It adds,
+;;     drops and regroups imports against the already-loaded package graph.
+;;
+;; `prelude-go-mode-defaults' additionally installs `gofmt-before-save'.
+;; That was merely redundant while goimports was absent; now that
+;; goimports is on PATH, prelude points `gofmt-command' at it -- and
+;; goimports applies plain gofmt rules, which quietly undo the extra
+;; normalisations gofumpt just made.  The two would disagree on every
+;; save, so `my/go-drop-prelude-gofmt' below removes prelude's hook and
+;; leaves gopls as the single formatter.
+
 (defun my/go-lsp-format-on-save ()
-  "Format Go buffer using LSP."
+  "Format the Go buffer with gopls, using gofumpt rules."
   (when (derived-mode-p 'go-mode 'go-ts-mode)
     (lsp-format-buffer)))
 
 (defun my/go-lsp-organize-imports ()
-  "Organize Go imports via LSP."
+  "Organize Go imports with gopls, using the goimports engine."
   (when (derived-mode-p 'go-mode 'go-ts-mode)
     (lsp-organize-imports)))
 
 (defun my/go-lsp-setup ()
-  "Setup Go LSP save hooks."
-  (add-hook 'before-save-hook #'my/go-lsp-organize-imports nil t)
-  (add-hook 'before-save-hook #'my/go-lsp-format-on-save nil t))
+  "Install this buffer's Go save hooks: organize imports, then format."
+  ;; Explicit depths rather than bare `add-hook', so the order is stated
+  ;; rather than inherited from the order these two calls happen to run
+  ;; in: imports first (that rewrites the import block), formatting second
+  ;; (that normalises whatever the rewrite produced).
+  (add-hook 'before-save-hook #'my/go-lsp-organize-imports -10 t)
+  (add-hook 'before-save-hook #'my/go-lsp-format-on-save    10 t))
+
+(defun my/go-drop-prelude-gofmt ()
+  "Remove prelude's `gofmt-before-save' so gopls is the only formatter."
+  (remove-hook 'before-save-hook #'gofmt-before-save t))
+
+;; Depth 95: prelude adds its hook from `go-ts-mode-hook', so this has to
+;; run after it.
+(add-hook 'go-ts-mode-hook #'my/go-drop-prelude-gofmt 95)
+(add-hook 'go-mode-hook    #'my/go-drop-prelude-gofmt 95)
+
+;; --- Keep super-save away from Go buffers -----------------------------
+;;
+;; `super-save-mode' is on (core/prelude-editor.el) and saves on window
+;; and buffer switches.  With the hooks above, every one of those saves
+;; reorganises imports and reformats -- so glancing at another window
+;; mid-edit can strip an import for a call you have not finished typing
+;; yet.  prelude-go excludes `go-mode' from `super-save-predicates', but
+;; this config remaps .go files to `go-ts-mode', which the exclusion
+;; misses.  A predicate returning nil blocks the save (`super-save-p'
+;; requires every predicate to pass).
+(with-eval-after-load 'super-save
+  (add-to-list 'super-save-predicates
+               (lambda () (not (derived-mode-p 'go-mode 'go-ts-mode)))))
+
+;; --- Stop drawing indentation tabs in Go buffers ---
+;;
+;; `prelude-go-mode-defaults' (core prelude, modules/prelude-go.el) calls
+;; (whitespace-toggle-options '(tabs)), which buffer-locally pushes `tabs'
+;; onto `whitespace-active-style'.  Every indentation tab then gets the
+;; `whitespace-tab' face -- which section 9 styles as a dim grey underline.
+;; Go indents with tabs by design, so the result is a long horizontal rule
+;; running through the indentation of every nested line.
+;;
+;; Restarting whitespace-mode makes it re-read the global `whitespace-style'
+;; (section 9), which deliberately leaves `tabs' out.  Makefiles keep their
+;; tab highlighting, where a tab-vs-space mixup is an actual syntax error.
+(defun my/go-untoggle-tab-visualization ()
+  "Undo prelude-go's tab highlighting in this Go buffer."
+  (when (and (bound-and-true-p whitespace-mode)
+             (memq 'tabs whitespace-active-style))
+    (whitespace-mode -1)
+    (whitespace-mode +1)))
+
+;; Depth 90: must run *after* prelude's own go hook, which is what turns
+;; tab visualization on in the first place.
+(add-hook 'go-ts-mode-hook #'my/go-untoggle-tab-visualization 90)
+(add-hook 'go-mode-hook    #'my/go-untoggle-tab-visualization 90)
 
 (use-package go-ts-mode
   :mode ("\\.go\\'" . go-ts-mode)
@@ -2342,14 +3022,223 @@ Targets a live agent-shell if there is one, else a claude-code-ide session."
   :config
   ;; gopls settings
   (setq lsp-go-use-gofumpt t)
-  (setq lsp-go-analyses '((unusedparams . t)
-                          (shadow . t)))
   (setq lsp-go-staticcheck t)
-  ;; inlay hints
-  (setq lsp-go-inlay-hints-parameter-names t)
-  (setq lsp-go-inlay-hints-variable-types t)
-  (setq lsp-go-inlay-hints-constant-values t)
-  (setq lsp-go-inlay-hints-function-type-parameters t))
+
+  ;; Analyzers.  gopls ships far more than the two that were enabled; each
+  ;; of these is an inspection GoLand runs by default.  `fieldalignment'
+  ;; is left off deliberately: it flags almost every struct in a real
+  ;; codebase and the payoff is padding bytes.
+  (setq lsp-go-analyses '((unusedparams   . t)
+                          (shadow         . t)
+                          (nilness        . t)   ; nil deref, impossible conditions
+                          (unusedwrite    . t)   ; value assigned, never read
+                          (useany         . t)   ; interface{} -> any
+                          (unusedvariable . t)
+                          (fieldalignment . :json-false)))
+
+  ;; Hover.  The default "SynopsisDocumentation" shows the first sentence
+  ;; only; GoLand's Ctrl+Q shows the whole doc comment.
+  (setq lsp-go-hover-kind "FullDocumentation")
+
+  ;; text/template and html/template files get gopls' template support,
+  ;; which GoLand has and plain go-ts-mode does not.
+  (setq lsp-go-template-extensions ["tmpl" "gotmpl" "gohtml"])
+
+  ;; Import grouping.  Set this to the module prefix (the first path
+  ;; element of `module' in go.mod, e.g. "github.com/unifize") and gopls
+  ;; will keep company imports in their own block, the way
+  ;; `goimports -local' does.  Left empty until the prefix is confirmed.
+  ;; (setq lsp-go-goimports-local "your.module/prefix")
+
+  ;; Inlay hints are configured below, outside this block -- lsp-go.el has
+  ;; no variables for them, so they need registering by hand.
+
+  ;; --- Test runner ---
+  ;;
+  ;; prelude-go installs these on `go-mode-map', but .go files are remapped
+  ;; to `go-ts-mode' (section 3), and `go-ts-mode-map' descends from
+  ;; `prog-mode-map', not from `go-mode-map'.  The result was an installed
+  ;; `gotest' package with no reachable keys at all.  Rebound here.
+  ;;
+  ;; All of these shadow global bindings only inside Go buffers, since a
+  ;; major-mode map outranks the global map.
+  (define-key go-ts-mode-map (kbd "C-c a")   #'go-test-current-project)
+  (define-key go-ts-mode-map (kbd "C-c m")   #'go-test-current-file)
+  (define-key go-ts-mode-map (kbd "C-c .")   #'go-test-current-test)
+  (define-key go-ts-mode-map (kbd "C-c b")   #'go-run)
+  (define-key go-ts-mode-map (kbd "C-c C-v") #'go-test-current-coverage)
+  (define-key go-ts-mode-map (kbd "C-c C-b") #'go-test-current-benchmark)
+  ;; GoLand's Ctrl+Shift+T: jump between foo.go and foo_test.go.
+  (define-key go-ts-mode-map (kbd "C-c C-t")
+              #'projectile-toggle-between-implementation-and-test))
+;; Note: `C-c C-d' is left alone -- go-ts-mode binds it to
+;; `go-ts-mode-docstring', which inserts a doc comment stub.  For symbol
+;; documentation use `C-c L h h' (lsp-describe-thing-at-point); it comes
+;; from gopls and covers dependencies, which `godoc-at-point' does not.
+
+;; --- Inlay hints ------------------------------------------------------
+;;
+;; `lsp-inlay-hint-enable' (section 10) makes lsp-mode ASK for hints; this
+;; is what tells gopls which ones to produce.
+;;
+;; The `lsp-go-inlay-hints-*' variables that used to live in the block
+;; above do not exist.  lsp-go.el registers 23 "gopls.*" settings and
+;; `hints' is not among them (grep it: the file mentions "inlay" twice,
+;; both about server capabilities), so those four setq calls were creating
+;; four global variables that nothing ever read.  Registering the setting
+;; by hand is the supported route -- `lsp-register-custom-settings' is the
+;; same mechanism lsp-go.el itself uses, and an alist of (symbol . t)
+;; serialises to a JSON object exactly like `lsp-go-analyses' does.
+;;
+;; Names and behaviour verified against the installed gopls via
+;; `gopls api-json'.  All eight default to off.  The « » markers below are
+;; gopls' own notation for where the hint text is drawn.
+(defvar lsp-go-hints
+  '(;; parseInt(« str: » "123", « radix: » 8)
+    (parameterNames         . t)
+    ;; i« int», j« int» := 0, len(r)-1
+    (assignVariableTypes    . t)
+    ;; for k« int», v« string» := range []string{} {
+    (rangeVariableTypes     . t)
+    ;; Point2D{«X: »1, «Y: »2}
+    (compositeLiteralFields . t)
+    ;; const ( KindNone Kind = iota« = 0» ; KindPrint«  = 1» )
+    (constantValues         . t)
+    ;; myFoo«[int, string]»(1, "hello")
+    (functionTypeParameters . t)
+
+    ;; Off by design, not oversight:
+    ;;
+    ;; compositeLiteralTypes annotates anonymous struct types inside
+    ;; composite literals.  In table-driven tests -- which is most Go test
+    ;; code -- that repeats the whole struct type on every case.
+    (compositeLiteralTypes  . :json-false)
+    ;; ignoredError appends "// ignore error" after every implicitly
+    ;; discarded error.  Genuinely useful for auditing, and genuinely
+    ;; noisy in code with many `defer f.Close()' lines.  Worth flipping on
+    ;; for a session when hunting swallowed errors.
+    (ignoredError           . :json-false))
+  "Inlay hints gopls should produce.  Sent as the gopls `hints' setting.")
+
+(with-eval-after-load 'lsp-mode
+  (lsp-register-custom-settings '(("gopls.hints" lsp-go-hints))))
+
+;; --- golangci-lint ----------------------------------------------------
+;;
+;; This is the closest thing to GoLand's inspection set: golangci-lint
+;; aggregates ~50 linters, well past what `go vet' plus the staticcheck
+;; gopls embeds will report.
+;;
+;; The MELPA package `flycheck-golangci-lint' is deliberately NOT used.
+;; It was last touched in 2019 and invokes `--out-format=checkstyle',
+;; a flag golangci-lint v2 removed outright (v2.12 here; the spelling is
+;; now `--output.checkstyle.path').  The installed binary rejects the old
+;; flag, so that package cannot work.  This is the same idea against the
+;; v2 command line.
+;;
+;; Scope is `.', the current package, not `./...'.  Whole-module linting
+;; on every check is far too slow to sit in the edit loop; use
+;; `my/go-golangci-lint-project' below for the full sweep.
+;;
+;; `--allow-serial-runners' is what keeps this usable.  golangci-lint
+;; takes a machine-global file lock in `os.TempDir()' on startup, and by
+;; default a second instance that cannot get the lock exits 3 with
+;; "parallel golangci-lint is running".  Flycheck then reports
+;; "Suspicious state ... returned 3, but its output contained no errors"
+;; and disables the checker.  Two Go buffers checking at once, or a
+;; flycheck run overlapping `my/go-golangci-lint-project', is enough to
+;; trigger it.  `--allow-serial-runners' makes the loser wait on the lock
+;; instead of failing.  Not `--allow-parallel-runners', which drops
+;; locking entirely and lets concurrent runs contend over the build cache.
+(with-eval-after-load 'flycheck
+  (flycheck-define-checker golangci-lint
+    "A Go metalinter, using the golangci-lint v2 command line."
+    :command ("golangci-lint" "run"
+              "--output.checkstyle.path" "stdout"
+              "--show-stats=false"
+              "--issues-exit-code" "0"
+              "--allow-serial-runners"
+              ".")
+    :error-parser flycheck-parse-checkstyle
+    :modes (go-mode go-ts-mode)
+    ;; golangci-lint reads the package from disk, so it must run from the
+    ;; file's own directory and only once the buffer matches the file.
+    :working-directory (lambda (_checker)
+                         (and buffer-file-name
+                              (file-name-directory buffer-file-name)))
+    :predicate (lambda ()
+                 (and buffer-file-name
+                      (not (buffer-modified-p)))))
+
+  (add-to-list 'flycheck-checkers 'golangci-lint t))
+
+;; Chain it behind lsp-mode's checker rather than replacing it, so gopls
+;; diagnostics stay primary and golangci-lint only adds to them.
+;;
+;; This cannot go in a `with-eval-after-load' on lsp-diagnostics: that
+;; file does not define the `lsp' checker when it loads.  The checker is
+;; created lazily by `lsp-diagnostics-lsp-checker-if-needed', called from
+;; inside the `lsp-diagnostics-mode' body -- so `flycheck-add-next-checker'
+;; would fire against a checker that does not exist yet and signal.
+;; `define-minor-mode' runs the mode hook after that body, which is the
+;; first moment both checkers are valid.
+;;
+;; Chaining onto `lsp' globally is fine even though the hook also fires
+;; for Python, Rust and Clojure buffers: flycheck honours a next-checker's
+;; `:modes', so golangci-lint only ever runs in Go buffers.
+(defvar my/golangci-lint-chained nil
+  "Non-nil once golangci-lint has been chained behind the `lsp' checker.")
+
+(defun my/chain-golangci-lint ()
+  "Append golangci-lint to the `lsp' checker's next-checkers, once."
+  (unless my/golangci-lint-chained
+    (when (and (fboundp 'flycheck-valid-checker-p)
+               (flycheck-valid-checker-p 'lsp)
+               (flycheck-valid-checker-p 'golangci-lint))
+      (flycheck-add-next-checker 'lsp '(warning . golangci-lint) t)
+      (setq my/golangci-lint-chained t))))
+
+(add-hook 'lsp-diagnostics-mode-hook #'my/chain-golangci-lint)
+
+(defun my/go-golangci-lint-project ()
+  "Run golangci-lint over the whole module in a compilation buffer.
+The live flycheck checker only covers the current package; this is the
+equivalent of GoLand's Inspect Code across the project."
+  (interactive)
+  (let ((default-directory (or (and (fboundp 'projectile-project-root)
+                                    (projectile-project-root))
+                               default-directory)))
+    (compile (concat "golangci-lint run"
+                     " --output.text.path stdout"
+                     " --output.text.colors=false"
+                     " --show-stats=false"
+                     " --allow-serial-runners"
+                     " ./..."))))
+
+;; --- Code generation: GoLand's Generate menu --------------------------
+;;
+;; Each of these is a thin wrapper over a binary already installed:
+;; gomodifytags, impl and gotests respectively.  Together they cover
+;; struct tags, "implement interface" stubs and table-test scaffolding.
+;; Bound under `C-c G' in Go buffers, which is free (`C-c g' is magit).
+(use-package go-tag
+  :ensure t
+  :commands (go-tag-add go-tag-remove))
+
+(use-package go-impl
+  :ensure t
+  :commands (go-impl))
+
+(use-package go-gen-test
+  :ensure t
+  :commands (go-gen-test-dwim go-gen-test-exported go-gen-test-all))
+
+(with-eval-after-load 'go-ts-mode
+  (define-key go-ts-mode-map (kbd "C-c G t") #'go-tag-add)
+  (define-key go-ts-mode-map (kbd "C-c G T") #'go-tag-remove)
+  (define-key go-ts-mode-map (kbd "C-c G i") #'go-impl)
+  (define-key go-ts-mode-map (kbd "C-c G g") #'go-gen-test-dwim)
+  (define-key go-ts-mode-map (kbd "C-c G l") #'my/go-golangci-lint-project))
 
 ;; ============================================================
 ;; 11c. Rust (rust-analyzer)
@@ -2359,7 +3248,11 @@ Targets a live agent-shell if there is one, else a claude-code-ide session."
   :mode ("\\.rs\\'" . rust-ts-mode)
   :hook
   (rust-ts-mode . lsp)
-  (rust-ts-mode . lsp-inlay-hints-mode)
+  ;; `lsp-inlay-hints-mode' deliberately NOT hooked here -- see the note on
+  ;; `lsp-inlay-hint-enable' in section 10.  This hook was the original
+  ;; source of the bogus "failed to define function lsp-inlay-hints-mode"
+  ;; autoload; it just happened to point at rust-ts-mode instead of
+  ;; go-ts-mode.  Rust inlay hints now come from the global switch.
   (rust-ts-mode . lsp-format-buffer-on-save)
   :config
   (setq lsp-rust-analyzer-cargo-watch-command "check")
