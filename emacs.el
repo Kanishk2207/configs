@@ -139,9 +139,9 @@ Safe for both GUI and terminal frames: GUI-only tweaks are guarded."
       (my/lock-cursor-color)
       (my/set-region-color)
       (when (display-graphic-p frame)
-        ;; No native scroll bars; yascroll draws a thin one in the fringe.
+        ;; No native scroll bars; `my/scroll-bar-mode' draws a thin one in the fringe.
         (set-frame-parameter frame 'vertical-scroll-bars nil)
-        ;; Left fringe 4 px (diagnostics), right fringe 8 px (yascroll thumb).
+        ;; Left fringe 4 px (diagnostics), right fringe 8 px (scroll bar thumb).
         (fringe-mode '(4 . 3))))))
 
 ;; Run for every client frame the daemon creates...
@@ -154,18 +154,315 @@ Safe for both GUI and terminal frames: GUI-only tweaks are guarded."
 (advice-add 'load-theme :after #'my/lock-cursor-color)
 (advice-add 'load-theme :after #'my/set-region-color)
 
-;; Thin scroll bar: `yascroll' draws a one-fringe-wide indicator in the
-;; right fringe of every window.  This is the reliable way to get a
-;; genuinely thin scroll bar on the NS build (see the note above).  Widen
-;; the right fringe if the thumb is too subtle for your taste.
-(use-package yascroll
-  :ensure t
-  :init
-  (scroll-bar-mode -1)                 ;; kill the native NS scroller
-  (global-yascroll-bar-mode 1)
-  :custom
-  (yascroll:delay-to-hide nil)         ;; nil = always visible (never auto-hide)
-  (yascroll:scroll-bar '(right-fringe)))
+;; Thin scroll bar, drawn in the right fringe and updated in real time.
+;;
+;; This replaces `yascroll', whose handler sits on `window-scroll-functions'
+;; and so runs inside redisplay on every scroll event: 5.72 ms per event on
+;; prometheus' tsdb/db_test.go (403k chars, 11.5k lines), and holding C-n
+;; scrolls once per line once point reaches the window edge.
+;;
+;; Where that 5.72 ms actually goes, measured:
+;;
+;;     (move-to-window-line 0)                      2.63 ms
+;;     (vertical-motion 26)                         1.01 ms
+;;     two whole-buffer (count-lines ...)           0.43 ms
+;;     everything else                             ~1.65 ms
+;;
+;; The obvious suspect is wrong.  Counting lines over the whole 403k-char
+;; buffer is only 0.2 ms, because `count-lines' is C.  The real expense is
+;; SCREEN-LINE LAYOUT: `move-to-window-line' and `vertical-motion' have to
+;; work out where text actually lands, which depends on wrapping, display
+;; properties, images and multi-line overlays.  No amount of line indexing
+;; helps with that -- a line index answers "which logical line", and layout
+;; is a different question.
+;;
+;; So the saving below comes from doing the layout work once, from
+;; `window-start', rather than from `move-to-window-line' plus a second
+;; walk.
+;;
+;; Sizing is by LOGICAL LINES.  Emacs' own native bar sizes by character
+;; share instead, which redisplay can do in C for free but which is visibly
+;; wrong on uneven files: in a 100-line buffer whose 4th line holds half
+;; the characters, scrolling past that one line moved a character-sized
+;; thumb from window line 1 to line 28 and shrank it from 42 segments to
+;; 16.  Counting lines costs almost nothing, so there is no reason to
+;; inherit that flaw.
+;;
+;; Cost is O(thumb position in screen lines), never O(buffer size): 1.3 ms
+;; here against yascroll's 5.72 ms.
+;;
+;; Not drawn on tty frames: fringes are zero-width there, so there is
+;; nothing to draw into.  yascroll had the same limitation, so no terminal
+;; scroll bar has been lost.  Drawing one in the text area is possible but
+;; needs its own handling of hscroll, truncation and line-number columns.
+
+(defcustom my/scroll-bar-side 'right-fringe
+  "Fringe to draw the scroll bar thumb in."
+  :type '(choice (const right-fringe) (const left-fringe))
+  :group 'convenience)
+
+(defcustom my/scroll-bar-priority 20
+  "Overlay priority for the thumb."
+  :type 'integer
+  :group 'convenience)
+
+(defface my/scroll-bar-thumb
+  '((t (:background "slateblue" :foreground "slateblue")))
+  "Face for the scroll bar thumb."
+  :group 'convenience)
+
+(defvar-local my/scroll-bar--overlays nil
+  "Thumb overlays currently drawn for this buffer, across all its windows.")
+
+(defvar-local my/scroll-bar--total-lines nil
+  "Cons of (MODIFIED-TICK . LINE-COUNT) for this buffer.")
+
+(defvar-local my/scroll-bar--visible-lines nil
+  "Logical lines the window shows.  See `my/scroll-bar--visible-lines'.")
+
+(defun my/scroll-bar--total-lines ()
+  "Line count of this buffer, recomputed only when it changes.
+`count-lines' is C and scans the whole 403k-char db_test.go in 0.20 ms,
+so this is cheap even uncached; the cache just makes it free."
+  (let ((tick (buffer-chars-modified-tick)))
+    (unless (eql (car my/scroll-bar--total-lines) tick)
+      (setq my/scroll-bar--total-lines
+            (cons tick (count-lines (point-min) (point-max)))))
+    (cdr my/scroll-bar--total-lines)))
+
+(defun my/scroll-bar--clear ()
+  "Delete every thumb overlay in this buffer."
+  (mapc #'delete-overlay my/scroll-bar--overlays)
+  (setq my/scroll-bar--overlays nil))
+
+(defun my/scroll-bar--usable-side ()
+  "Return the fringe to draw in, or nil if this window has none."
+  (let ((fringes (window-fringes)))
+    (pcase my/scroll-bar-side
+      ('right-fringe (and (> (nth 1 fringes) 0) 'right-fringe))
+      ('left-fringe  (and (> (nth 0 fringes) 0) 'left-fringe))
+      (_ nil))))
+
+(defun my/scroll-bar--make-overlay (side win)
+  "Put one thumb segment on SIDE of WIN at point."
+  (let* ((pos (point))
+         ;; An overlay exactly at end of line puts the bitmap on this
+         ;; visual line; anywhere else it needs the following character.
+         (pos (if (= (line-end-position) pos) pos (1+ pos)))
+         (ov (make-overlay pos pos)))
+    (overlay-put ov 'after-string
+                 (propertize "." 'display
+                             `(,side filled-rectangle my/scroll-bar-thumb)))
+    (overlay-put ov 'window win)
+    (overlay-put ov 'priority my/scroll-bar-priority)
+    ov))
+
+(defun my/scroll-bar--visible-lines (win start settled)
+  "Logical lines WIN currently shows, cached.
+
+`window-end' is STALE inside `window-scroll-functions' -- it still
+describes the window redisplay last drew, not the one about to be drawn.
+Measured on a 53-line window jumping 50 lines: window-end reported line
+2055 while the truth after redisplay was 2105, so a fresh computation
+there yields 4 visible lines instead of 54.  That is what collapsed the
+thumb to a sliver on C-v, M-v and fast trackpad scrolling.
+
+How many lines a window shows is a property of the window, not of where
+it is scrolled to, so it is cached and only recomputed when SETTLED --
+that is, from the post-redisplay pass or a configuration change, never
+from the scroll hook.  `window-body-height' seeds it before the first
+settle; that is exact unless lines wrap."
+  (cond
+   ((and settled (window-end win))
+    (setq my/scroll-bar--visible-lines
+          (max 1 (count-lines start (window-end win)))))
+   (my/scroll-bar--visible-lines)
+   (t (setq my/scroll-bar--visible-lines (max 1 (window-body-height win))))))
+
+(defun my/scroll-bar--draw (win &optional start settled)
+  "Draw the thumb for WIN.  Assumes WIN is selected and already cleared.
+START, when given, is the window start `window-scroll-functions' is about
+to install, which `window-start' does not yet report.  SETTLED means
+redisplay has finished, so `window-end' can be trusted."
+  (let ((side (my/scroll-bar--usable-side)))
+    (when side
+      (let* ((h     (max 1 (window-body-height win)))
+             (start (or start (window-start win)))
+             (total (my/scroll-bar--total-lines)))
+        (when (> total 0)
+          (let* (;; Both in LOGICAL LINES, not characters.  Sizing by
+                 ;; character share, the way Emacs' own native scroll bar
+                 ;; does, is visibly wrong on uneven files: in a 100-line
+                 ;; buffer whose 4th line holds half the characters,
+                 ;; scrolling that single line moved the thumb from window
+                 ;; line 1 to line 28 and shrank it from 42 segments to 16.
+                 ;; Lines cost almost nothing to count here -- 0.075 ms for
+                 ;; `line-number-at-pos' plus a cached total -- because the
+                 ;; expensive part of a scroll bar was never line counting.
+                 (visible (my/scroll-bar--visible-lines win start settled))
+                 ;; Position, unlike size, is recomputed on every scroll and
+                 ;; is exact: START is the value the hook is installing and
+                 ;; `line-number-at-pos' reads text, not display state.
+                 (start-line (1- (line-number-at-pos start))))
+            ;; Whole buffer already on screen: no thumb, like a real one.
+            (when (< visible total)
+              (let* ((size (max 1 (min h (round (* h (/ (float visible) total))))))
+                     (top  (max 0 (min (- h size)
+                                       (floor (* h (/ (float start-line) total)))))))
+                ;; The thumb sits on a screen line, and reaching screen line
+                ;; TOP means asking Emacs to lay the text out: ~0.05 ms per
+                ;; line, so up to ~2.5 ms at the bottom of a tall window.
+                ;;
+                ;; Interpolating a buffer position instead was tried and is
+                ;; wrong.  Character fraction is a fine proxy for where the
+                ;; thumb belongs across a whole buffer, but not for which
+                ;; screen line it lands on inside one window, where a
+                ;; handful of long lines skew it badly: scrolled to 25% the
+                ;; thumb appeared on line 17 of 53 instead of 13, and at
+                ;; 100% on line 0.  Correctness wins over the millisecond.
+                (save-excursion
+                  (if (and settled (/= 0 (window-vscroll win t)))
+                      ;; A pixel scroll has left the window offset by a
+                      ;; partial line.  `vertical-motion' from `window-start'
+                      ;; then misses the intended window line by up to 4
+                      ;; (measured: deltas of -4, -3, +1, +2 against
+                      ;; `move-to-window-line').  `move-to-window-line' is
+                      ;; authoritative and vscroll-aware; it costs ~3 ms, but
+                      ;; this branch is only reached once the flick has
+                      ;; stopped, never during it.
+                      (move-to-window-line top)
+                    (goto-char start)
+                    (vertical-motion top win))
+                  (cl-loop repeat size
+                           do (push (my/scroll-bar--make-overlay side win)
+                                    my/scroll-bar--overlays)
+                           until (zerop (vertical-motion 1 win))))))))))))
+
+(defun my/scroll-bar--refresh (&optional scrolled-window scrolled-start settled)
+  "Redraw the thumb in every window showing this buffer.
+SCROLLED-WINDOW and SCROLLED-START come from `window-scroll-functions',
+which reports the start it is about to install before `window-start'
+returns it.  SETTLED means redisplay has finished and display state can
+be trusted.
+
+The body runs with redisplay inhibited and the window hooks unbound.
+Creating overlays is a display change, and this is itself called from
+inside redisplay, so without that guard it can re-enter."
+  (when (and (bound-and-true-p my/scroll-bar-mode)
+             ;; Mid pixel-scroll the window sits at a partial-line offset and
+             ;; the cheap placement is wrong by several lines, which is the
+             ;; jitter you see dragging on a trackpad.  Leave the existing
+             ;; thumb where it is rather than drawing it somewhere wrong; the
+             ;; settle pass repositions it accurately the moment the flick
+             ;; stops.  Pixel scrolls that land on a line boundary have
+             ;; vscroll 0 and take the normal path, so the thumb still tracks
+             ;; the scroll rather than freezing.
+             (or settled
+                 (zerop (window-vscroll (or scrolled-window (selected-window)) t))))
+    ;; Never let a scroll bar break redisplay.
+    (with-demoted-errors "scroll bar: %S"
+      (let ((inhibit-redisplay t)
+            window-configuration-change-hook
+            window-size-change-functions
+            window-state-change-hook)
+        (my/scroll-bar--clear)
+        (unless (minibufferp)
+          (dolist (win (get-buffer-window-list (current-buffer) nil t))
+            (with-selected-window win
+              (my/scroll-bar--draw
+               win (and (eq win scrolled-window) scrolled-start)
+               settled)))
+          (setq my/scroll-bar--last-view
+                (my/scroll-bar--view-key (selected-window))))))))
+
+;; --- Settling pass ---
+;;
+;; Two things cannot be known from inside `window-scroll-functions':
+;; `window-end' is still the previous frame's, and pixel scrolling moves
+;; sub-line via `window-vscroll' without changing `window-start' at all, so
+;; the hook does not even fire.  A zero-delay idle timer runs after
+;; redisplay has completed, when both are accurate, and corrects whatever
+;; the scroll-time estimate got wrong.  It is debounced to one pending
+;; timer, so a fast trackpad flick settles once rather than per event.
+(defvar my/scroll-bar--settle-timer nil)
+
+(defun my/scroll-bar--settle ()
+  "Recompute with trustworthy display state, once redisplay is done."
+  (setq my/scroll-bar--settle-timer nil)
+  (when (bound-and-true-p my/scroll-bar-mode)
+    (my/scroll-bar--refresh nil nil 'settled)))
+
+(defun my/scroll-bar--schedule-settle ()
+  (unless my/scroll-bar--settle-timer
+    (setq my/scroll-bar--settle-timer
+          (run-with-idle-timer 0 nil #'my/scroll-bar--settle))))
+
+(defvar-local my/scroll-bar--last-view nil
+  "Cons of (WINDOW-START . VSCROLL) at the last draw.")
+
+(defun my/scroll-bar--view-key (win)
+  (cons (window-start win) (window-vscroll win t)))
+
+(defun my/scroll-bar--on-command ()
+  "Catch the scrolling `window-scroll-functions' never reports.
+
+That hook fires only when `window-start' changes.  `pixel-scroll-precision'
+-- which is what `wheel-up' and `wheel-down' are bound to here -- moves
+within a line by changing `window-vscroll' and leaving `window-start'
+alone.  Measured: one 40px trackpad scroll left vscroll at 8, fired the
+scroll hook zero times, and scheduled no settle at all.  That is the thumb
+sitting still while the text moves.
+
+Comparing the view key first makes this free after ordinary commands, so
+it does not put a redraw behind every keystroke."
+  (unless (equal (my/scroll-bar--view-key (selected-window))
+                 my/scroll-bar--last-view)
+    (my/scroll-bar--schedule-settle)))
+
+(defun my/scroll-bar--on-scroll (win start)
+  "Entry point for `window-scroll-functions'."
+  (my/scroll-bar--refresh win start)
+  (my/scroll-bar--schedule-settle))
+
+(defun my/scroll-bar--on-change (&rest _)
+  "Entry point for `after-change-functions' and friends.
+Takes and discards any arguments: `after-change-functions' passes three,
+`window-configuration-change-hook' passes none."
+  (my/scroll-bar--refresh)
+  (my/scroll-bar--schedule-settle))
+
+(define-minor-mode my/scroll-bar-mode
+  "Thin fringe scroll bar whose cost does not depend on buffer size."
+  :lighter nil
+  (if my/scroll-bar-mode
+      (progn
+        (add-hook 'window-scroll-functions #'my/scroll-bar--on-scroll nil t)
+        (add-hook 'window-configuration-change-hook #'my/scroll-bar--on-change nil t)
+        ;; Editing moves `point-max', so the thumb has to resize.  This is
+        ;; O(window height), not O(buffer), so it is affordable per
+        ;; keystroke -- which is exactly what yascroll could not say, since
+        ;; it counted the whole buffer on every change too.
+        (add-hook 'after-change-functions #'my/scroll-bar--on-change nil t)
+        (add-hook 'post-command-hook #'my/scroll-bar--on-command nil t)
+        (my/scroll-bar--refresh nil nil 'settled))
+    (remove-hook 'post-command-hook #'my/scroll-bar--on-command t)
+    (remove-hook 'window-scroll-functions #'my/scroll-bar--on-scroll t)
+    (remove-hook 'window-configuration-change-hook #'my/scroll-bar--on-change t)
+    (remove-hook 'after-change-functions #'my/scroll-bar--on-change t)
+    (my/scroll-bar--clear)))
+
+(defun my/scroll-bar--turn-on ()
+  "Enable the scroll bar where it makes sense."
+  (unless (or (minibufferp)
+              (derived-mode-p 'image-mode)
+              (string-prefix-p " " (buffer-name)))
+    (my/scroll-bar-mode 1)))
+
+(define-globalized-minor-mode global-my/scroll-bar-mode
+  my/scroll-bar-mode my/scroll-bar--turn-on)
+
+(scroll-bar-mode -1)                     ;; kill the native NS scroller
+(global-my/scroll-bar-mode 1)
 
 ;; ============================================================
 ;; 5. Scrolling
@@ -448,6 +745,15 @@ Safe for both GUI and terminal frames: GUI-only tweaks are guarded."
   ;; function lsp-inlay-hints-mode".  A mode hook is also simply too early:
   ;; it runs before the server is connected.
   (setq lsp-inlay-hint-enable t)
+  ;; ...but do not recompute them from inside redisplay.  lsp-mode puts
+  ;; `lsp--update-inlay-hints-scroll-function' on `window-scroll-functions'
+  ;; when this is non-nil, and that handler calls (window-end window t) --
+  ;; forcing a display simulation -- then fires a request, on every scroll
+  ;; event.  Measured at 4.56 ms per scroll on a 403k-char buffer.
+  ;; Hints still refresh through `lsp-on-idle-hook', which
+  ;; `lsp-inlay-hints-mode' also registers, so nothing is lost except
+  ;; mid-scroll updates.
+  (setq lsp-update-inlay-hints-on-scroll nil)
   ;; Semantic highlighting from the language server: colors functions,
   ;; macros, keywords, locals, and definitions that the tree-sitter grammar
   ;; can't distinguish on its own.  Biggest visual win for Clojure; also
@@ -551,6 +857,217 @@ Safe for both GUI and terminal frames: GUI-only tweaks are guarded."
 (with-eval-after-load 'lsp-mode
   (my/lsp-style-inlay-hints))
 (advice-add 'load-theme :after #'my/lsp-style-inlay-hints)
+
+;; --- Inlay hint range: whole buffer for normal files ------------------
+;;
+;; lsp-mode asks only for the visible window, so hints for anything you
+;; scroll to arrive `lsp-idle-delay' later.  The obvious fix -- request a
+;; band of a few hundred lines around the window -- turns out not to be a
+;; thing gopls offers.  Measured against gopls v0.23 on prometheus:
+;;
+;;     buffer        range asked          hints back   latency
+;;     db_test.go    20 lines @ L5000         63         14 ms
+;;     db_test.go    50 lines @ L5000         63         13 ms
+;;     db_test.go   100 lines @ L5000       9549        154 ms
+;;     db_test.go   400 lines @ L5000       9549        372 ms
+;;     db_test.go   whole file (11.5k)      9549        442 ms
+;;     db_test.go    40 lines @ L1          9549        151 ms
+;;     main.go       40 lines @ L1          1076         33 ms
+;;
+;; Note the last two rows: a 40-line range answers with the whole file, so
+;; this is not a simple size cut-off and I do not have a model for what
+;; gopls is really keying on.  What is reliable is the practical shape --
+;; asking for a mid-sized band gets you the whole file anyway, so the only
+;; two honest choices are visible-window or whole-buffer.
+;;
+;; Whole-buffer is affordable now that the scroll hooks are out of the way:
+;; a C-n step costs 0.265 ms with all 9549 hints present, against 0.096 ms
+;; with only the visible 248 overlays, and 2.819 ms back when this felt
+;; laggy.  What it buys is that scrolling never waits for hints again,
+;; because they are already everywhere.
+;;
+;; What it costs is one request per EDIT rather than per scroll, and that
+;; request grows with file size.  Hence the ceiling: above it, fall back to
+;; lsp-mode's visible-window behaviour rather than tie gopls up for half a
+;; second every time you pause typing in a very large file.
+
+;; The freeze this fixes, measured on db_test.go with a 50 ms heartbeat
+;; timer detecting UI stalls.  Isolating each `lsp-on-idle-hook' entry over
+;; four scroll-then-pause cycles:
+;;
+;;     nothing              max   59 ms   total frozen     0 ms
+;;     inlay-hints-only     max 2492 ms   total frozen  7335 ms
+;;     lens-only            max  125 ms   total frozen     0 ms
+;;     doc-highlight-only   max   59 ms   total frozen     0 ms
+;;     doc-links-only       max   67 ms   total frozen     0 ms
+;;     breadcrumb-only      max  102 ms   total frozen     0 ms
+;;     code-actions-only    max   71 ms   total frozen     0 ms
+;;
+;; The cost is not the request (151 ms) and not raw overlay creation (7 ms
+;; for 9549 overlays).  It is `lsp--position-to-point', which lsp-mode's
+;; renderer calls once per hint and which is O(line):
+;;
+;;     (goto-char (point-min)) (forward-line line)
+;;
+;; 9549 hints averaging line ~5800 is roughly 55 million line steps per
+;; response.  So the fix is not to render fewer overlays, it is to avoid
+;; converting positions for hints nobody can see.  Every InlayHint carries
+;; its line as a plain integer, so filtering on that costs nothing and only
+;; the visible handful ever pays the conversion.
+
+(defcustom my/lsp-inlay-hint-render-margin-lines 200
+  "Lines above and below the window for which inlay hints are drawn.
+The whole buffer is fetched once and cached; this only controls how much
+of that cache is turned into overlays at a time."
+  :type 'integer
+  :group 'lsp-mode)
+
+(defvar-local my/lsp-inlay--tick nil
+  "`buffer-chars-modified-tick' at the last whole-buffer hint request.")
+
+(defvar-local my/lsp-inlay--retries 0
+  "Consecutive whole-buffer requests that produced no hints.")
+
+(defvar-local my/lsp-inlay--cache nil
+  "Raw InlayHint objects from the last whole-buffer response.")
+
+(defvar-local my/lsp-inlay--rendered nil
+  "Cons of (TOP-LINE . BOTTOM-LINE), zero-based, currently drawn.")
+
+(defun my/lsp-inlay--draw (hint)
+  "Create the overlay for HINT.
+A faithful copy of the body of `lsp-update-inlay-hints', which offers no
+way to render a subset.  Being a copy, it can drift on an lsp-mode
+upgrade; if hints ever look wrong, diff it against that function first.
+
+Deliberately NOT written with lsp-mode's `(&InlayHint :label ...)'
+destructuring, which is what that function uses.  That pattern is resolved
+by a `dash-expand:&InlayHint' macro which `lsp-protocol' only defines once
+it loads -- and this file is read at startup, long before lsp-mode is
+pulled in.  With the macro absent, `-let*' silently falls back to ordinary
+list destructuring and every hint dies at runtime with
+
+    wrong-type-argument listp #s(hash-table ... \"line\" 645 ...)
+
+Plain accessor FUNCTIONS resolve when they are called instead of when this
+file is read, so they are immune to the load order."
+  (let* ((label         (lsp:inlay-hint-label hint))
+         (position      (lsp:inlay-hint-position hint))
+         (kind          (or (lsp:inlay-hint-kind? hint)
+                            lsp/inlay-hint-kind-type-hint))
+         (padding-left? (lsp:inlay-hint-padding-left? hint))
+         (padding-right? (lsp:inlay-hint-padding-right? hint))
+         (tooltip?      (lsp:inlay-hint-tooltip? hint))
+         (label-str     (lsp--label-from-inlay-hints-response label kind))
+         (pos           (lsp--position-to-point position)))
+    (when label-str
+      (let ((overlay (make-overlay pos pos nil 'front-advance 'end-advance)))
+        (overlay-put overlay 'lsp-inlay-hint t)
+        (overlay-put overlay 'lsp-inlay-hint-data hint)
+        (overlay-put overlay 'before-string
+                     (propertize
+                      (format "%s%s%s"
+                              (if padding-left? " " "")
+                              (let ((s label-str))
+                                (when (and tooltip? (stringp label))
+                                  (setq s (propertize
+                                           s 'help-echo
+                                           (lsp--inlay-hint-tooltip-text tooltip?))))
+                                s)
+                              (if padding-right? " " ""))
+                      'keymap lsp--inlay-hint-mouse-map))))))
+
+(defun my/lsp-inlay--render (&optional force)
+  "Draw cached hints for the window plus `my/lsp-inlay-hint-render-margin-lines'.
+Filtering happens on the line number carried in each hint, an integer
+already in the response, so out-of-band hints never reach the expensive
+`lsp--position-to-point'."
+  (when my/lsp-inlay--cache
+    (let* ((m    my/lsp-inlay-hint-render-margin-lines)
+           ;; LSP lines are zero-based, `line-number-at-pos' is one-based.
+           (wtop (1- (line-number-at-pos (window-start))))
+           (wbot (1- (line-number-at-pos (or (window-end) (point-max)))))
+           (top  (max 0 (- wtop m)))
+           (bot  (+ wbot m)))
+      ;; Hysteresis: only redraw once the window leaves the drawn band, so
+      ;; ordinary scrolling inside the margin costs nothing at all.
+      (when (or force
+                (null my/lsp-inlay--rendered)
+                (< wtop (car my/lsp-inlay--rendered))
+                (> wbot (cdr my/lsp-inlay--rendered)))
+        (lsp--remove-overlays 'lsp-inlay-hint)
+        (setq my/lsp-inlay--rendered (cons top bot))
+        (dolist (hint my/lsp-inlay--cache)
+          (let ((ln (lsp:position-line (lsp:inlay-hint-position hint))))
+            (when (and (>= ln top) (<= ln bot))
+              (my/lsp-inlay--draw hint))))))))
+
+(defun my/lsp-inlay--fetch ()
+  "Request every hint in the buffer and cache the response."
+  (let ((buf (current-buffer)))
+    (lsp-request-async
+     "textDocument/inlayHint"
+     (lsp-make-inlay-hints-params
+      :text-document (lsp--text-document-identifier)
+      :range (lsp-make-range :start (lsp-point-to-position (point-min))
+                             :end   (lsp-point-to-position (point-max))))
+     (lambda (res)
+       (when (buffer-live-p buf)
+         (with-current-buffer buf
+           (setq my/lsp-inlay--cache res
+                 my/lsp-inlay--rendered nil)
+           (my/lsp-inlay--render t))))
+     ;; `tick' and the cancel token match what lsp-mode uses: drop the
+     ;; response if the buffer changed under it, and supersede any request
+     ;; still in flight.
+     :mode 'tick
+     :cancel-token :inlay-hints)))
+
+(defun my/lsp-update-inlay-hints ()
+  "Override for `lsp--update-inlay-hints'.
+Fetch the whole buffer once per edit, then serve scrolling from the cache.
+No size threshold: the visible-window path lsp-mode uses is strictly worse
+here, because gopls answers with every hint in the file whatever range you
+ask for, so that path paid the identical cost on every single pause."
+  (let ((tick (buffer-chars-modified-tick)))
+    (cond
+     ;; First visit, or the buffer changed: refetch.
+     ((not (eql tick my/lsp-inlay--tick))
+      (setq my/lsp-inlay--tick tick
+            my/lsp-inlay--retries 0)
+      (my/lsp-inlay--fetch))
+     ;; Have data: redraw only if the window left the drawn band.
+     (my/lsp-inlay--cache
+      (my/lsp-inlay--render))
+     ;; Requested, nothing arrived.  gopls silently ignored these for about
+     ;; a minute while re-indexing after a restart, which would otherwise
+     ;; leave the buffer bare until the next edit.
+     ((< my/lsp-inlay--retries 10)
+      (setq my/lsp-inlay--retries (1+ my/lsp-inlay--retries))
+      (my/lsp-inlay--fetch)))))
+
+(defun my/lsp-inlay--reset-tick ()
+  "Force the next idle tick to refetch hints in this buffer.
+Toggling `lsp-inlay-hints-mode' deletes every hint overlay; without this
+the tick would still match and they would never come back."
+  (setq my/lsp-inlay--tick nil
+        my/lsp-inlay--retries 0
+        my/lsp-inlay--cache nil
+        my/lsp-inlay--rendered nil))
+
+(defun my/lsp-inlay--reset-all-ticks (&rest _)
+  "Re-request hints everywhere after a language server (re)connects.
+A gopls restart drops whatever it knew, and the per-buffer tick would
+otherwise still match and suppress the request."
+  (dolist (b (buffer-list))
+    (with-current-buffer b
+      (when (bound-and-true-p lsp-inlay-hints-mode)
+        (my/lsp-inlay--reset-tick)))))
+
+(with-eval-after-load 'lsp-mode
+  (advice-add 'lsp--update-inlay-hints :override #'my/lsp-update-inlay-hints)
+  (add-hook 'lsp-inlay-hints-mode-hook #'my/lsp-inlay--reset-tick)
+  (add-hook 'lsp-after-initialize-hook #'my/lsp-inlay--reset-all-ticks))
 
 ;; Language IDs for tree-sitter modes lsp-mode doesn't know yet.
 (with-eval-after-load 'lsp-mode
@@ -758,6 +1275,9 @@ workspace searches.  Truncation is reported, never silent."
 (defvar-local my/lsp-usage-lens--tick nil
   "Value of `buffer-chars-modified-tick' when the lenses were drawn.")
 
+(defvar-local my/lsp-usage-lens--decl-cache nil
+  "Cons of (MODIFIED-TICK . DECLARATION-NODES) for this buffer.")
+
 (defun my/lsp--count-locations (res)
   "Count the locations in RES.
 A references or implementation response is either a collection of
@@ -838,7 +1358,26 @@ the request has to be issued from the identifier's position."
     (when (overlayp (cdr cell)) (delete-overlay (cdr cell))))
   (setq my/lsp-usage-lens--overlays nil
         my/lsp-usage-lens--wanted nil
-        my/lsp-usage-lens--tick nil))
+        my/lsp-usage-lens--tick nil
+        my/lsp-usage-lens--decl-cache nil))
+
+(defun my/lsp-usage-lens--all-declarations ()
+  "Every top-level declaration node in this buffer, cached until it changes.
+Walking all top-level children and matching `treesit-defun-type-regexp'
+measured 0.41 ms on a 403k-char file, and it ran on every idle tick even
+though nothing had moved.  The parse tree only changes when the buffer
+does, so the scan is keyed on `buffer-chars-modified-tick'; what remains
+per tick is a numeric range filter over the cached list."
+  (let ((tick (buffer-chars-modified-tick)))
+    (unless (eql (car my/lsp-usage-lens--decl-cache) tick)
+      (let ((rx (or treesit-defun-type-regexp ""))
+            (hits '()))
+        (dolist (child (treesit-node-children (treesit-buffer-root-node) t))
+          (let ((type (treesit-node-type child)))
+            (when (and (stringp type) (string-match-p rx type))
+              (push child hits))))
+        (setq my/lsp-usage-lens--decl-cache (cons tick (nreverse hits)))))
+    (cdr my/lsp-usage-lens--decl-cache)))
 
 (defun my/lsp-usage-lens--wants-impls-p (node)
   "Non-nil when asking gopls for implementations of NODE is meaningful.
@@ -924,16 +1463,15 @@ counts, just not the ones you cannot see."
   (pcase my/lsp-usage-lens-scope
     ('window
      (let* ((beg (window-start))
-            (end (window-end nil t))
-            (rx  (or treesit-defun-type-regexp ""))
+            ;; Plain `window-end': the forced variant simulates display, and
+            ;; nothing here needs pixel accuracy.  A declaration one line off
+            ;; either edge is a harmless miss, corrected on the next tick.
+            (end (or (window-end) (point-max)))
             (here (treesit-defun-at-point))
             (hits '()))
-       (dolist (child (treesit-node-children (treesit-buffer-root-node) t))
+       (dolist (child (my/lsp-usage-lens--all-declarations))
          (let ((start (treesit-node-start child)))
-           (when (and (stringp (treesit-node-type child))
-                      (string-match-p rx (treesit-node-type child))
-                      (>= start beg)
-                      (<= start end))
+           (when (and (>= start beg) (<= start end))
              (push child hits))))
        (setq hits (nreverse hits))
        ;; Union in the enclosing declaration when its signature is above
@@ -1549,16 +2087,16 @@ Also apply a small redisplay-cost win for the terminal buffer."
 
 ;; Catch-all safety net: the globalized-mode enablers run from
 ;; `after-change-major-mode-hook', so append a disable there (runs last,
-;; wins) for anything the exclusion lists above miss -- notably yascroll,
-;; which has no exclusion variable.
+;; wins) for anything the exclusion lists above miss -- notably the scroll
+;; bar, which has no exclusion variable.
 (defun my/vterm-disable-heavy-modes ()
   "Disable `after-change-functions' minor modes in terminal buffers."
   (when (derived-mode-p 'vterm-mode 'ghostel-mode)
     (when (bound-and-true-p font-lock-mode) (font-lock-mode -1))
     (when (and (fboundp 'flycheck-mode) (bound-and-true-p flycheck-mode))
       (flycheck-mode -1))
-    (when (and (fboundp 'yascroll-bar-mode) (bound-and-true-p yascroll-bar-mode))
-      (yascroll-bar-mode -1))))
+    (when (bound-and-true-p my/scroll-bar-mode)
+      (my/scroll-bar-mode -1))))
 (add-hook 'after-change-major-mode-hook #'my/vterm-disable-heavy-modes t)
 
 ;; Snap Claude's window back to the live screen when you return to it.
