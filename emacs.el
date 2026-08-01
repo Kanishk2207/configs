@@ -56,14 +56,30 @@
 ;; /opt/homebrew/bin is needed both for `exec-path' lookups and for
 ;; vterm's first-load compile (it shells out to `cmake', which reads the
 ;; PATH env var, not `exec-path'), so keep both in sync.
-(dolist (dir '("/Users/kanishk/elixir-ls/release"
-               "/Users/kanishk/.nvm/versions/node/v24.14.0/bin"
-               "/opt/homebrew/bin"))
+;;
+;; The node bin directory is RESOLVED, not hardcoded: nvm installs each version
+;; under its own path, so pinning one (it used to be v24.14.0) silently breaks
+;; every node-installed binary the moment nvm upgrades and removes it.  That is
+;; not hypothetical -- v24.14.0 was already gone while still listed here, which
+;; hid `claude-agent-acp' (the ACP adapter, see section 10b) from the daemon.
+(defun my/nvm-node-bin ()
+  "Return the newest installed nvm node `bin' directory, or nil."
+  (car (last (sort (seq-filter #'file-directory-p
+                               (file-expand-wildcards
+                                (expand-file-name "~/.nvm/versions/node/*/bin")))
+                   #'string-version-lessp))))
+
+(dolist (dir (delq nil (list "/Users/kanishk/elixir-ls/release"
+                             (my/nvm-node-bin)
+                             "/opt/homebrew/bin")))
   (add-to-list 'exec-path dir))
 
-(let ((brew-bin "/opt/homebrew/bin"))
-  (unless (member brew-bin (split-string (or (getenv "PATH") "") path-separator))
-    (setenv "PATH" (concat brew-bin path-separator (getenv "PATH")))))
+;; Keep the PATH env var in step with `exec-path'.  Subprocesses that re-exec
+;; through a shell (cmake for vterm, `npx' under the ACP adapter) read PATH, not
+;; `exec-path', so both have to carry the same directories.
+(dolist (bin (delq nil (list "/opt/homebrew/bin" (my/nvm-node-bin))))
+  (unless (member bin (split-string (or (getenv "PATH") "") path-separator))
+    (setenv "PATH" (concat bin path-separator (getenv "PATH")))))
 
 ;; ============================================================
 ;; 3. Tree-sitter (Emacs 30 built-in modes)
@@ -1611,64 +1627,88 @@ half-height (the mystery window), and would give Claude a full half."
 
 (global-set-key (kbd "C-x +") #'my/balance-windows-including-side)
 
-;; --- Manually size / lock / unlock the Claude side window ---
+;; --- Manually size / lock / unlock an agent side window ---
+;;
+;; Covers BOTH integrations: the claude-code-ide terminal side window and the
+;; agent-shell (ACP) side window, since both are displayed on the right and the
+;; question "how wide should the agent be" is the same either way.
 ;;
 ;; Workflow:
-;;   1. M-x claude-code-ide-set-window-width   -- set an exact width
-;;   2. M-x claude-code-ide-fix-window-width   -- lock it: C-x + (and any
-;;      other resize, including mouse dragging) leaves the Claude window
-;;      alone and balances only the other windows around it
-;;   3. M-x claude-code-ide-unfix-window-width -- unlock: C-x + gives
-;;      Claude an equal column share again (the default behavior)
+;;   1. M-x my/agent-window-set-width    -- set an exact width
+;;   2. M-x my/agent-window-fix-width    -- lock it: C-x + (and any other
+;;      resize, including mouse dragging) leaves the agent window alone and
+;;      balances only the other windows around it
+;;   3. M-x my/agent-window-unfix-width  -- unlock: C-x + gives the agent an
+;;      equal column share again (the default behavior)
 ;;
-;; The lock uses the built-in buffer-local `window-size-fixed', which
-;; every Emacs resize primitive honors.  It lives on the Claude BUFFER,
-;; so it survives hiding/re-showing the side window.
+;; The lock uses the built-in buffer-local `window-size-fixed', which every
+;; Emacs resize primitive honors.  It lives on the agent BUFFER, so it survives
+;; hiding and re-showing the side window, and it is per-buffer -- so a locked
+;; claude-code-ide window and an unlocked agent-shell window coexist fine.
 
-(defun claude-code-ide--side-window ()
-  "Return the Claude Code side window in the selected frame, or nil."
-  (seq-find (lambda (w)
-              (and (window-parameter w 'window-side)
-                   (string-prefix-p "*claude-code["
-                                    (buffer-name (window-buffer w)))))
-            (window-list nil 'no-minibuffer)))
+(defun my/agent-side-window-p (window)
+  "Non-nil if WINDOW is a side window showing an agent buffer.
+Recognizes claude-code-ide by buffer name and agent-shell by major mode, which
+is sturdier than matching agent-shell's configurable
+`agent-shell-buffer-name-format'."
+  (and (window-live-p window)
+       (window-parameter window 'window-side)
+       (let ((buf (window-buffer window)))
+         (or (string-prefix-p "*claude-code[" (buffer-name buf))
+             (provided-mode-derived-p
+              (buffer-local-value 'major-mode buf) 'agent-shell-mode)))))
 
-(defun claude-code-ide-set-window-width (width)
-  "Set the Claude Code side window to WIDTH columns.
-Works even while the width is locked with
-`claude-code-ide-fix-window-width' (the lock is bypassed for this
-one resize and stays on afterwards)."
+(defun my/agent-side-window ()
+  "Return an agent side window in the selected frame, or nil.
+Prefers the selected window when it qualifies, so with both a claude-code-ide
+and an agent-shell window open the one you are in is the one you resize."
+  (or (and (my/agent-side-window-p (selected-window)) (selected-window))
+      (seq-find #'my/agent-side-window-p (window-list nil 'no-minibuffer))))
+
+(defun my/agent-window--require ()
+  "Return an agent side window, or signal a `user-error'."
+  (or (my/agent-side-window)
+      (user-error "No agent side window in this frame")))
+
+(defun my/agent-window-set-width (width)
+  "Set the agent side window to WIDTH columns.
+Works even while the width is locked with `my/agent-window-fix-width' (the lock
+is bypassed for this one resize and stays on afterwards)."
   (interactive
-   (let ((win (or (claude-code-ide--side-window)
-                  (user-error "No Claude side window in this frame"))))
-     (list (read-number "Claude window width (columns): "
-                        (window-total-width win)))))
-  (let ((win (or (claude-code-ide--side-window)
-                 (user-error "No Claude side window in this frame"))))
+   (list (read-number "Agent window width (columns): "
+                      (window-total-width (my/agent-window--require)))))
+  (let ((win (my/agent-window--require)))
     (with-current-buffer (window-buffer win)
       (let ((window-size-fixed nil))
         (window-resize win (- width (window-total-width win)) t)))
-    (message "Claude window width set to %d columns" (window-total-width win))))
+    (message "%s window width set to %d columns"
+             (buffer-name (window-buffer win)) (window-total-width win))))
 
-(defun claude-code-ide-fix-window-width ()
-  "Lock the Claude side window at its current width.
+(defun my/agent-window-fix-width ()
+  "Lock the agent side window at its current width.
 `C-x +' then balances only the other windows around it."
   (interactive)
-  (let ((win (or (claude-code-ide--side-window)
-                 (user-error "No Claude side window in this frame"))))
+  (let ((win (my/agent-window--require)))
     (with-current-buffer (window-buffer win)
       (setq-local window-size-fixed 'width))
-    (message "Claude window locked at %d columns" (window-total-width win))))
+    (message "%s window locked at %d columns"
+             (buffer-name (window-buffer win)) (window-total-width win))))
 
-(defun claude-code-ide-unfix-window-width ()
-  "Unlock the Claude side window width.
+(defun my/agent-window-unfix-width ()
+  "Unlock the agent side window width.
 `C-x +' includes it in balancing again (equal column share)."
   (interactive)
-  (let ((win (or (claude-code-ide--side-window)
-                 (user-error "No Claude side window in this frame"))))
+  (let ((win (my/agent-window--require)))
     (with-current-buffer (window-buffer win)
       (setq-local window-size-fixed nil))
-    (message "Claude window width unlocked")))
+    (message "%s window width unlocked" (buffer-name (window-buffer win)))))
+
+;; Old names kept working, so existing muscle memory and any `M-x' history
+;; entries still resolve.
+(defalias 'claude-code-ide--side-window      #'my/agent-side-window)
+(defalias 'claude-code-ide-set-window-width  #'my/agent-window-set-width)
+(defalias 'claude-code-ide-fix-window-width  #'my/agent-window-fix-width)
+(defalias 'claude-code-ide-unfix-window-width #'my/agent-window-unfix-width)
 
 ;; --- Fix half-window rendering in Claude's transcript view (C-o) ---
 ;;
@@ -1711,6 +1751,485 @@ centering the cursor."
 (with-eval-after-load 'claude-code-ide
   (advice-add 'claude-code-ide--terminal-position-keeper
               :override #'claude-code-ide--terminal-position-keeper-fixed))
+
+;; ============================================================
+;; 10b. Claude Code over ACP (agent-shell), beside claude-code-ide
+;; ============================================================
+;;
+;; TWO integrations on purpose, because they are good at different things.
+;;
+;;   * claude-code-ide + ghostel runs the real Claude Code CLI in a terminal.
+;;     Full fidelity: `/compact', Esc-Esc transcript rewind, scheduled and
+;;     background tasks, `/usage', `/plugin' -- everything the CLI's own TUI
+;;     does, because it IS the CLI's own TUI.
+;;
+;;   * agent-shell speaks ACP (Agent Client Protocol, "LSP but for coding
+;;     agents") to `claude-agent-acp', which drives the Claude Agent SDK.  There
+;;     is no terminal: the conversation is an ordinary Emacs buffer and the
+;;     prompt is ordinary Emacs input.  The part that matters most here is that
+;;     Claude's file access is served BY Emacs -- agent-shell implements ACP's
+;;     `fs/read_text_file' and `fs/write_text_file', so a read prefers an OPEN
+;;     BUFFER (unsaved edits included) and a write lands via
+;;     `replace-buffer-contents' in the live buffer plus `basic-save-buffer'.
+;;     That means: no auto-revert race, no "buffer has unsaved changes so Emacs
+;;     refuses to revert" stand-off (see the autorevert note in section 10), a
+;;     minimal marker-preserving edit rather than a whole-file rewrite, and
+;;     C-/ undo of anything Claude did.
+;;
+;; Both integrations talk to the SAME Emacs tool server, configured below, so
+;; every tool Claude can call in one it can call in the other.
+
+;; --- Emacs tools over MCP, shared by both integrations ---
+;;
+;; claude-code-ide ships an MCP (Model Context Protocol) tools server that runs
+;; INSIDE Emacs over HTTP -- `claude-code-ide-mcp-http-server.el', bound to
+;; 127.0.0.1, on top of the `web-server' package.  `claude-code-ide-emacs-tools-setup'
+;; registers five tools into it: xref references, xref apropos, project info,
+;; imenu symbols, and tree-sitter info.  We add two more below.
+;;
+;; ACP itself has NO channel for an agent to call custom client tools.  Its
+;; client surface is only `fs/read_text_file', `fs/write_text_file',
+;; permissions, terminals and elicitation -- and acp.el advertises just the two
+;; fs capabilities.  So the way to give the ACP path these tools is to register
+;; the server as an ordinary Claude Code MCP server: `claude-agent-acp' starts
+;; the SDK with settingSources ["user" "project" "local"], so a server declared
+;; in ~/.claude.json is picked up by the ACP adapter AND by the plain CLI.  One
+;; declaration, both integrations, and it keeps working if either is swapped out.
+;;
+;; It has to be HTTP rather than stdio.  Session-scoped stdio servers handed
+;; over ACP's `session/new.mcpServers' currently never reach the model
+;; (claude-agent-acp issue #883: registered, but no tools/list, not even shown
+;; as known-but-unconnected), whereas the adapter advertises
+;; `mcpCapabilities.http' and maps `type: "http"' entries correctly.
+;;
+;; Register it once, from a shell:
+;;
+;;   claude mcp add -s user -t http emacs http://127.0.0.1:8765/mcp
+;;
+;; which is why the port is PINNED here.  The package default is nil, meaning a
+;; random port per session -- fine when claude-code-ide injects the URL itself,
+;; useless for a static declaration.
+(setq claude-code-ide-mcp-server-port 8765)
+
+;; --- Compat: MELPA's `web-server' predates the API claude-code-ide expects ---
+;;
+;; This is why the Emacs tools were never actually reaching Claude.
+;; claude-code-ide's HTTP server calls `ws-process' / `ws-headers' / `ws-body'.
+;; Upstream emacs-web-server namespaced its eieio accessors to exactly those
+;; names, but the newest MELPA build (web-server 0.1.2, built 2021-07-08, which
+;; is what is installed) still declares them un-prefixed as `process' /
+;; `headers' / `body'.  So `ws-start' succeeds and the very next line dies with
+;; "Symbol's function definition is void: ws-process" -- and because
+;; `claude-code-ide-mcp-server--start-server' CATCHES that and only logs a
+;; warning, claude-code-ide has been running with NO Emacs tools rather than
+;; failing loudly.  Alias the three missing names; the `fboundp' guards make the
+;; whole thing a no-op the day MELPA catches up with upstream.
+(with-eval-after-load 'web-server
+  (dolist (pair '((ws-process . process)
+                  (ws-headers . headers)
+                  (ws-body    . body)))
+    (unless (fboundp (car pair))
+      (defalias (car pair) (cdr pair)))))
+
+(defun my/mcp--user-buffer ()
+  "Return the buffer the user is most plausibly looking at.
+`buffer-list' is in most-recently-used order and is reordered by window
+selection, NOT by `set-buffer'/`with-current-buffer' -- so the first
+file-visiting buffer that is also displayed stays a reliable answer even though
+this runs inside the MCP server's process filter, where `current-buffer' is
+whatever Emacs happened to leave current."
+  (or (seq-find (lambda (b)
+                  (and (buffer-file-name b) (get-buffer-window b t)))
+                (buffer-list))
+      (seq-find #'buffer-file-name (buffer-list))))
+
+;; --- Make the built-in tools follow your attention ---
+;;
+;; claude-code-ide's own five tools run inside
+;; `claude-code-ide-mcp-server-with-session-context', which ERRORS outright
+;; ("No session context found for session nil") unless the request arrived on a
+;; per-session URL like /mcp/<session-id> that claude-code-ide registered when it
+;; launched a CLI session.  A static ~/.claude.json declaration cannot carry
+;; that, and a hardcoded session id could only ever pin ONE project.
+;;
+;; So supply the context live instead: when no session is registered, synthesize
+;; one from the buffer the developer is looking at.  For a single long-lived
+;; daemon this is better than a pinned project directory anyway, because
+;; `project-info' and the xref tools then track where you actually are rather
+;; than where the session happened to start.  claude-code-ide's own sessions
+;; return a real context, so for those this advice never fires.
+(defun my/mcp--fallback-session-context (result)
+  "Filter-return advice: synthesize an MCP session context when RESULT is nil."
+  (or result
+      (when-let ((buf (my/mcp--user-buffer)))
+        (list :project-dir (with-current-buffer buf
+                             (or (and (fboundp 'projectile-project-root)
+                                      (ignore-errors (projectile-project-root)))
+                                 default-directory))
+              :buffer buf
+              :last-active-buffer buf))))
+
+(with-eval-after-load 'claude-code-ide-mcp-server
+  (advice-add 'claude-code-ide-mcp-server-get-session-context
+              :filter-return #'my/mcp--fallback-session-context))
+
+(defun my/mcp-emacs-context ()
+  "Report what the user currently has open, selected, and in flight.
+This is the PULL replacement for claude-code-ide's push-based `selection_changed'
+notification.  ACP has no equivalent (its `document/didFocus' family belongs to
+the inline-completion surface, not to a chat turn), so instead of streaming
+cursor moves at Claude we let Claude ask when it actually matters."
+  (let ((buf (my/mcp--user-buffer)))
+    (if (not buf)
+        "No file-visiting buffer is currently open in Emacs."
+      (with-current-buffer buf
+        (let* ((win (get-buffer-window buf t))
+               (pos (if win (window-point win) (point)))
+               (others (seq-uniq
+                        (delq nil (mapcar (lambda (w)
+                                            (buffer-file-name (window-buffer w)))
+                                          (window-list nil 'no-mini)))))
+               (diags (ignore-errors
+                        (require 'claude-code-ide-diagnostics)
+                        (claude-code-ide-diagnostics-get-all buf))))
+          (string-join
+           (delq nil
+                 (list
+                  (format "Current file: %s" (or (buffer-file-name) (buffer-name)))
+                  (format "Major mode: %s" major-mode)
+                  (format "Cursor: line %d, column %d (of %d lines)"
+                          (line-number-at-pos pos)
+                          (save-excursion (goto-char pos) (current-column))
+                          (line-number-at-pos (point-max)))
+                  (when (buffer-modified-p)
+                    (concat "NOTE: this buffer has UNSAVED changes. Reads through "
+                            "the editor already see them; read the file rather "
+                            "than assuming disk contents."))
+                  (when (use-region-p)
+                    (format "Active selection, lines %d-%d:\n```\n%s\n```"
+                            (line-number-at-pos (region-beginning))
+                            (line-number-at-pos (region-end))
+                            (buffer-substring-no-properties
+                             (region-beginning)
+                             (min (region-end) (+ (region-beginning) 4000)))))
+                  (when (cdr others)
+                    (format "Other files visible on screen: %s"
+                            (string-join (delete (buffer-file-name) others) ", ")))
+                  (when (and diags (> (length diags) 0))
+                    (format "This file has %d diagnostic(s); call emacs_diagnostics for them."
+                            (length diags)))
+                  (format "Working directory: %s" default-directory)))
+           "\n"))))))
+
+(defun my/mcp-diagnostics (&optional file_path)
+  "Return the diagnostics Emacs has ALREADY computed for FILE_PATH.
+Defaults to the buffer the user is looking at.  Reuses claude-code-ide's backend
+abstraction, which auto-detects flycheck or flymake per buffer -- this config
+runs flycheck nearly everywhere and flymake-ruff in Python, so both matter.
+Cheaper and more faithful than asking Claude to shell out to a linter, because
+these results already reflect the UNSAVED buffer."
+  (require 'claude-code-ide-diagnostics)
+  (let ((buf (if (and file_path (not (string-empty-p file_path)))
+                 (find-file-noselect file_path)
+               (my/mcp--user-buffer))))
+    (if (not (buffer-live-p buf))
+        "No such buffer or file."
+      (let ((diags (append (claude-code-ide-diagnostics-get-all buf) nil))
+            (name (buffer-file-name buf)))
+        (if (null diags)
+            (format "No diagnostics for %s." (or name (buffer-name buf)))
+          (mapconcat
+           (lambda (d)
+             (let ((start (map-nested-elt d '(range start))))
+               (format "%s:%s:%s: %s: %s [%s]"
+                       (or name (buffer-name buf))
+                       (alist-get 'line start) (alist-get 'character start)
+                       (alist-get 'severity d) (alist-get 'message d)
+                       (alist-get 'source d))))
+           diags "\n"))))))
+
+(defun my/mcp-register-emacs-tools ()
+  "Start the shared Emacs MCP tools server and register every tool on it.
+Idempotent: `claude-code-ide-make-tool' registers via `add-to-list', so
+re-running only re-adds specs that actually changed."
+  (interactive)
+  (require 'claude-code-ide)
+  (require 'claude-code-ide-mcp-server)
+  ;; `claude-code-ide-mcp-xref-find-apropos' calls `apropos-parse-pattern', which
+  ;; apropos.el does NOT autoload (only `apropos' itself carries a cookie).  In a
+  ;; session that has never run `C-h a' the tool therefore fails with "Symbol's
+  ;; function definition is void".  Load it up front.
+  (require 'apropos)
+  ;; Registers the five built-ins AND flips `claude-code-ide-enable-mcp-server',
+  ;; which `claude-code-ide-mcp-server-ensure-server' gates on.
+  (claude-code-ide-emacs-tools-setup)
+  (claude-code-ide-make-tool
+   :function #'my/mcp-emacs-context
+   :name "emacs_context"
+   :description
+   (concat "What the developer is looking at in their editor RIGHT NOW: the "
+           "current file, cursor position, any active text selection, other "
+           "files visible on screen, and whether the buffer has unsaved edits. "
+           "Call this when the user says \"this file\", \"here\", \"this "
+           "function\", or otherwise refers to their editor state without "
+           "naming a path.")
+   :args nil)
+  (claude-code-ide-make-tool
+   :function #'my/mcp-diagnostics
+   :name "emacs_diagnostics"
+   :description
+   (concat "Linter and language-server diagnostics that the editor has already "
+           "computed for a file, including for unsaved changes. Prefer this "
+           "over running a linter yourself: it is instant and it reflects the "
+           "buffer, not the file on disk.")
+   :args '((:name "file_path"
+                  :type string
+                  :optional t
+                  :description "Absolute path; defaults to the file the developer is viewing")))
+  (or (claude-code-ide-mcp-server-ensure-server)
+      (user-error "Could not start the Emacs MCP tools server on port %s"
+                  claude-code-ide-mcp-server-port)))
+
+;; Start it once the daemon is up, slightly deferred so it never sits on the
+;; critical path of the first frame.  It must be listening BEFORE Claude
+;; connects, because the ~/.claude.json declaration is static: nothing spins the
+;; server up on demand the way claude-code-ide does for its own sessions.
+(add-hook 'after-init-hook
+          (lambda ()
+            (run-at-time 2 nil (lambda ()
+                                 (ignore-errors (my/mcp-register-emacs-tools))))))
+
+;; --- agent-shell ---
+(use-package agent-shell
+  :ensure t
+  ;; A long list on purpose.  agent-shell carries `;;;###autoload' cookies on
+  ;; only a handful of its commands (`agent-shell', `agent-shell-toggle',
+  ;; `agent-shell-new-shell', `agent-shell-fork', `agent-shell-restart',
+  ;; `agent-shell-resume-session', `agent-shell-prompt-compose' and the
+  ;; per-vendor starters), so on a cold daemon `M-x agent-shell-switch-buffer'
+  ;; and most of the rest simply would not be found until something else pulled
+  ;; the package in.  Everything named here gets an autoload stub, so `M-x'
+  ;; completion offers it from the first frame.
+  :commands (agent-shell-anthropic-start-claude-code
+             agent-shell-buffers agent-shell-switch-buffer agent-shell-other-buffer
+             agent-shell-interrupt agent-shell-status
+             agent-shell-send-dwim agent-shell-send-region agent-shell-send-region-to
+             agent-shell-send-current-file agent-shell-send-file agent-shell-send-other-file
+             agent-shell-quote-region agent-shell-insert-file
+             agent-shell-insert-shell-command-output
+             agent-shell-send-clipboard-image agent-shell-send-screenshot
+             agent-shell-set-session-mode agent-shell-cycle-session-mode
+             agent-shell-set-session-model agent-shell-set-session-thought-level
+             agent-shell-show-usage agent-shell-prompt-queue
+             agent-shell-open-transcript agent-shell-copy-as-markdown
+             agent-shell-copy-session-id agent-shell-copy-source-block-at-point
+             agent-shell-narrow-to-block
+             agent-shell-diff-accept-all agent-shell-diff-reject-all
+             agent-shell-view-acp-logs agent-shell-toggle-logging agent-shell-version)
+  :custom
+  ;; Same slot as the claude-code-ide side window, so the window commands
+  ;; further down (`my/balance-windows-including-side',
+  ;; `claude-code-ide-set-window-width' and the width lock) apply unchanged and
+  ;; the two integrations never fight over screen real estate.
+  (agent-shell-display-action
+   '(display-buffer-in-side-window (side . right) (window-width . 100)))
+  ;; On start, offer the resumable sessions for this project alongside "new".
+  ;; This is the conversation switcher: the adapter advertises session/list,
+  ;; session/resume, session/load and session/fork, so all of it is real.
+  (agent-shell-session-strategy 'prompt)
+  ;; Replay the WHOLE conversation back into the buffer when resuming, via
+  ;; `session/load'.  Costs a beat on restore, and buys the thing that matters
+  ;; here: isearch / swiper / consult-line and region-kill work over the entire
+  ;; history the moment a session is back, not just over what arrives next.
+  (agent-shell-session-restore-verbosity 'full)
+  ;; Permission mode for new sessions.  `default' is Claude Code's "Manual":
+  ;; prompt before edits and before anything dangerous.  The alternatives the
+  ;; adapter advertises are `acceptEdits', `auto', `plan', `dontAsk' and
+  ;; (when permitted) `bypassPermissions'; `C-c C-m' switches per session and
+  ;; `C-<tab>' cycles, so this is only the starting point.
+  (agent-shell-anthropic-default-session-mode-id "default")
+  :config
+  ;; Same reasoning as the terminal buffers: a long conversation buffer is
+  ;; rewritten constantly while streaming, and flycheck / yascroll hooked into
+  ;; `after-change-functions' there is pure cost.  Font-lock stays ON, unlike in
+  ;; a terminal -- here it is what renders the markdown.
+  (with-eval-after-load 'flycheck
+    (add-to-list 'flycheck-global-modes 'agent-shell-mode t)))
+
+(defun my/agent-shell-live-p ()
+  "Non-nil when at least one agent-shell buffer exists."
+  (and (fboundp 'agent-shell-buffers)
+       (featurep 'agent-shell)
+       (agent-shell-buffers)))
+
+;; --- Transcripts in both places ---
+;;
+;; agent-shell writes every conversation to <project>/.agent-shell/transcripts/
+;; as it happens, which keeps a transcript next to the code it discusses but
+;; makes "search everything I have ever asked Claude" a walk over many roots.
+;; So also collect them centrally -- as a HARD LINK, not a copy: the mirror
+;; shares the file's inode, so it stays current while the conversation streams
+;; in, with no duplicated bytes, no timer and nothing to keep in sync.
+;;
+;; Remember `git check-ignore' hygiene: add `.agent-shell/' to your global
+;; gitignore, or every repo grows an untracked directory.
+(defvar my/agent-shell-transcript-mirror-dir
+  (expand-file-name "agent-shell-transcripts/" user-emacs-directory)
+  "Directory holding a hard link to every agent-shell transcript.
+Flat, so one `rg PATTERN' over it searches every conversation in every
+project.  Not indexed by `agent-recall' -- see its `search-paths' below.")
+
+(defun my/agent-shell-mirror-transcript (path)
+  "Hard-link transcript PATH into `my/agent-shell-transcript-mirror-dir'.
+`:filter-return' advice on `agent-shell--ensure-transcript-file', so PATH is
+passed through untouched and the advised function's contract is preserved.
+Falls back to a symlink when the two ends are on different filesystems."
+  (when (and path (file-exists-p path))
+    (ignore-errors
+      (unless (file-directory-p my/agent-shell-transcript-mirror-dir)
+        (make-directory my/agent-shell-transcript-mirror-dir t))
+      ;; Name the link <project>-<timestamp>.md: every project stamps its
+      ;; transcripts with the same format, so the bare names would collide.
+      ;; PATH is <project>/.agent-shell/transcripts/<stamp>.md, hence "../../".
+      (let* ((project (file-name-nondirectory
+                       (directory-file-name
+                        (expand-file-name "../../" (file-name-directory path)))))
+             (link (expand-file-name
+                    (format "%s-%s" project (file-name-nondirectory path))
+                    my/agent-shell-transcript-mirror-dir)))
+        (unless (file-exists-p link)
+          (condition-case nil
+              (add-name-to-file path link)
+            (error (make-symbolic-link path link t)))))))
+  path)
+
+(with-eval-after-load 'agent-shell
+  (advice-add 'agent-shell--ensure-transcript-file
+              :filter-return #'my/agent-shell-mirror-transcript))
+
+;; --- agent-shell companions ---
+
+(use-package agent-recall
+  :ensure t
+  :after agent-shell
+  :custom
+  ;; Roots scanned for <project>/.agent-shell/transcripts/.  Deliberately NOT
+  ;; `my/agent-shell-transcript-mirror-dir': agent-recall would index both a
+  ;; transcript and its hard link and report every hit twice.  The mirror is for
+  ;; one-shot `rg' from a shell; agent-recall reads the originals.
+  (agent-recall-search-paths '("~/professional/" "~/.emacs.d/"))
+  :commands (agent-recall-search agent-recall-search-live
+             agent-recall-browse agent-recall-reindex))
+
+(use-package agent-shell-attention
+  :vc (:url "https://github.com/ultronozm/agent-shell-attention.el" :rev :newest)
+  :after agent-shell
+  :config
+  ;; Mode-line indicator for which shells are waiting on a permission answer.
+  ;; With Manual permissions this is the thing that tells you a session is
+  ;; blocked without having to keep its window on screen.
+  (agent-shell-attention-mode 1))
+
+(use-package agent-shell-manager
+  :vc (:url "https://github.com/jethrokuan/agent-shell-manager" :rev :newest)
+  :commands (agent-shell-manager-toggle))
+
+;; --- Desktop notifications, with a macOS backend ---
+;;
+;; agent-shell-notifications ships two providers: libnotify (D-Bus, so Linux
+;; only) and an experimental knockknock one that is not on MELPA and needs an
+;; unmerged upstream PR.  Neither works here.  Its backend contract is just four
+;; variables (see agent-shell-notifications-libnotify.el), so supply an
+;; `osascript' provider: no extra dependency, native banners.
+;;
+;; The trade-off: `osascript' can post a banner but cannot dismiss one or carry
+;; a click action, so `close' is a no-op and the `agent-shell-attention'
+;; mode-line indicator above stays the thing you actually click.  Installing
+;; `terminal-notifier' (`brew install terminal-notifier') would restore both
+;; through its -group / -remove / -execute flags if that ever matters.
+;;
+;; Strings go to `osascript' as ARGV, never interpolated into the script, so
+;; quotes, backslashes and newlines in a tool name or error message cannot
+;; break or inject into the AppleScript.
+(defconst my/osascript-notify-program
+  "on run argv\ndisplay notification (item 1 of argv) with title (item 2 of argv)\nend run"
+  "AppleScript that posts its two arguments as a notification.")
+
+(defun my/agent-shell-notify-macos (plist)
+  "Post PLIST, a `notifications-notify' style plist, as a macOS banner."
+  (ignore-errors
+    (start-process "agent-shell-notify" nil "osascript"
+                   "-e" my/osascript-notify-program
+                   (or (plist-get plist :body) "")
+                   (or (plist-get plist :title) "agent-shell")))
+  'my/osascript-notification)
+
+;; Installed by hand into site-lisp rather than with `:vc', because
+;; `package-vc' unions the `Package-Requires' of EVERY .el in the repo into one
+;; descriptor -- and the optional `agent-shell-notifications-knockknock.el'
+;; backend declares `(agent-shell-notifications "0.1")' and `(knockknock
+;; "0.3")'.  That yields a package that depends on ITSELF (install blows the
+;; Lisp nesting limit) and on knockknock, which is not on MELPA.  The main file
+;; needs only `agent-shell', so a plain `:load-path' sidesteps the descriptor
+;; entirely.  `git -C ~/.emacs.d/site-lisp/agent-shell-notifications pull' to
+;; update; the knockknock backend is deleted locally, being unusable here.
+(use-package agent-shell-notifications
+  :load-path "site-lisp/agent-shell-notifications"
+  :after agent-shell
+  :hook (agent-shell-mode . agent-shell-notifications-mode)
+  :config
+  (setq agent-shell-notifications-send-function #'my/agent-shell-notify-macos
+        agent-shell-notifications-close-function #'ignore
+        agent-shell-notifications-transform-function #'identity
+        agent-shell-notifications-transform-timeout-function #'identity))
+
+;; --- M-i: send the region to whichever Claude is running ---
+;;
+;; Prefers agent-shell when one is live, because `agent-shell-send-dwim' is
+;; strictly the better version of this action: the region arrives as a clickable
+;; `file:line-start-line-end' reference rather than a bare @-mention, it falls
+;; back to the flycheck/flymake error at point when there is no region, and it
+;; QUEUES the text if Claude is mid-turn instead of dropping it.
+(defun my/claude-add-region-or-tab ()
+  "Region active: send it to Claude.  No region: `tab-to-tab-stop'.
+Targets a live agent-shell if there is one, else a claude-code-ide session."
+  (interactive)
+  (cond
+   ((not (use-region-p))
+    (call-interactively #'tab-to-tab-stop))
+   ((my/agent-shell-live-p)
+    (call-interactively #'agent-shell-send-dwim))
+   (t
+    (call-interactively #'claude-code-ide-insert-at-mentioned))))
+
+;; --- agent-shell command prefix ---
+;;
+;; `C-c C-;', deliberately shaped like the `C-c C-'' that opens the
+;; claude-code-ide menu: two punctuation chords, neither one a common
+;; major-mode binding, so nothing shadows them in a code buffer.
+(defvar my/agent-shell-map
+  (let ((m (make-sparse-keymap)))
+    (define-key m (kbd "a") #'agent-shell-anthropic-start-claude-code)
+    (define-key m (kbd "b") #'agent-shell-switch-buffer)
+    (define-key m (kbd "n") #'agent-shell-new-shell)
+    ;; Branch the conversation from here into a new shell, leaving this one
+    ;; intact.  The nearest thing ACP offers to the CLI's Esc-Esc rewind, which
+    ;; the adapter does not expose yet (issue #583).
+    (define-key m (kbd "f") #'agent-shell-fork)
+    (define-key m (kbd "r") #'agent-shell-resume-session)
+    ;; Every session is also written to <project>/.agent-shell/transcripts/*.md
+    ;; as it happens, so past conversations are grep-able across projects.
+    (define-key m (kbd "t") #'agent-shell-open-transcript)
+    (define-key m (kbd "c") #'agent-shell-prompt-compose)
+    (define-key m (kbd "s") #'agent-shell-status)
+    ;; Companions: tabulated view of every shell, and transcript search.
+    (define-key m (kbd "l") #'agent-shell-manager-toggle)
+    (define-key m (kbd "/") #'agent-recall-search-live)
+    (define-key m (kbd "R") #'agent-recall-browse)
+    m)
+  "Keymap for agent-shell commands, bound to `C-c C-;'.")
+
+(global-set-key (kbd "C-c C-;") my/agent-shell-map)
 
 ;; ============================================================
 ;; 11a. Python (Pyright + Ruff)
