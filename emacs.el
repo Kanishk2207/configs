@@ -715,9 +715,31 @@ Takes and discards any arguments: `after-change-functions' passes three,
 (use-package lsp-mode
   :ensure t
   :init
-  ;; Corfu + completion-at-point-functions setup
-  ;; (avoids company-mode autoconfig warnings).
-  (setq lsp-completion-provider :capf)
+  ;; Corfu is the one and only completion UI.
+  ;;
+  ;; `:none' is the ONLY value that leaves the completion UI alone.  In
+  ;; lsp-mode's vocabulary `:capf' is short for *company*-capf -- its own
+  ;; defcustom reads `(const :tag "Use company-capf" :capf)' -- and
+  ;; `lsp-completion.el' acts on anything other than `:none' by running
+  ;;
+  ;;     (company-mode 1)
+  ;;     (setq-local company-backends (cl-adjoin 'company-capf ...))
+  ;;
+  ;; in every managed buffer.  That is how company-mode came to be live in
+  ;; every Go buffer here despite `global-company-mode' being nil, no hook
+  ;; enabling it, and `prelude-company' being commented out: lsp-mode was
+  ;; switching it on, buffer by buffer, alongside Corfu.
+  ;;
+  ;; Nothing is lost by saying `:none'.  `lsp-completion-at-point' is added
+  ;; to `completion-at-point-functions' before that `cond' is reached, so it
+  ;; stays first in the list and Corfu reads it exactly as before.  `:none'
+  ;; also emits no warning whether or not company is installed, which is
+  ;; what the previous comment here was worried about.
+  ;;
+  ;; The `company' package is uninstalled.  Keep `prelude-company' commented
+  ;; out in personal/prelude-modules.el -- it does
+  ;; (prelude-require-packages '(company)) and would quietly undo this.
+  (setq lsp-completion-provider :none)
   ;; Snippet completion.  gopls only sends parameter placeholders
   ;; (`lsp-go-use-placeholders' and `lsp-go-complete-function-calls', both
   ;; t by default) when the client advertises snippet support, and that
