@@ -461,6 +461,19 @@ Takes and discards any arguments: `after-change-functions' passes three,
 (define-globalized-minor-mode global-my/scroll-bar-mode
   my/scroll-bar-mode my/scroll-bar--turn-on)
 
+(defun my/scroll-bar-toggle (&optional arg)
+  "Toggle the fringe scroll bar everywhere.
+With a positive prefix ARG turn it on, with a negative one turn it off.
+This drives the globalized mode, so it also removes the per-buffer hooks
+in buffers that already have it, not just the visible thumb."
+  (interactive "P")
+  (global-my/scroll-bar-mode
+   (cond ((null arg) (if global-my/scroll-bar-mode -1 1))
+         ((> (prefix-numeric-value arg) 0) 1)
+         (t -1)))
+  (message "Fringe scroll bar %s"
+           (if global-my/scroll-bar-mode "on" "off")))
+
 (scroll-bar-mode -1)                     ;; kill the native NS scroller
 (global-my/scroll-bar-mode 1)
 
@@ -1285,6 +1298,64 @@ workspace searches.  Truncation is reported, never silent."
   :type 'number
   :group 'lsp-mode)
 
+(defface my/lsp-usage-lens-face
+  '((t :inherit lsp-inlay-hint-face :height 0.9))
+  "Face for the usage counts drawn at the end of a declaration line.
+Inheriting from `lsp-inlay-hint-face' means this tracks the grey that
+`my/lsp-style-inlay-hints' sets, including after a theme change, without
+needing its own `load-theme' advice.
+
+Keep `:height' at or below 1.0.  A screen row is as tall as its tallest
+glyph, so a smaller face cannot grow the row -- measured at 16 px with
+and without the annotation.  A taller face would grow it, and a row that
+changes height as the lens arrives is the vertical jitter that drawing at
+end of line exists to avoid.
+
+Vertical placement is handled by `my/lsp-usage-lens--raise-factor', which
+reads this face's real metrics, so changing the height here needs no
+other edit."
+  :group 'lsp-mode)
+
+(defvar my/lsp-usage-lens--raise nil
+  "Cached (KEY . FACTOR) for `my/lsp-usage-lens--raise-factor'.")
+
+(defun my/lsp-usage-lens--raise-factor ()
+  "Factor for `raise' that vertically centres the lens text in its row.
+Every glyph on a screen line shares one baseline, placed at the row's
+maximum ascent, so a smaller font is inset unevenly.  Menlo 14 measures
+ascent 13 descent 3, and scaling the height shrinks only the ascent: at
+0.8 the face is 10/3, which puts the whole 3 px of slack above the text
+and none below it.  That is why an unraised lens reads as sitting on the
+bottom of the row rather than in the middle of it.
+
+Centring means lifting by half the difference of the two insets,
+
+  raise_px = ((Ad - Dd) - (As - Ds)) / 2
+
+and `raise' takes a multiple of the raised text's own height, hence the
+final division.  At 0.9 that is 0.5 px, against 1.5 px at 0.8.
+
+Cached because this runs once per lens drawn.  The key covers the frame
+font size, the face height, and whether the frame is graphical at all --
+`font-info' has nothing to report on a tty, and this daemon serves both."
+  (let ((key (list (frame-char-height)
+                   (face-attribute 'my/lsp-usage-lens-face :height nil t)
+                   (display-graphic-p))))
+    (unless (equal (car my/lsp-usage-lens--raise) key)
+      (setq my/lsp-usage-lens--raise
+            (cons key
+                  (or (and (display-graphic-p)
+                           (ignore-errors
+                             (let* ((di (font-info (face-font 'default)))
+                                    (si (font-info (face-font 'my/lsp-usage-lens-face)))
+                                    (ad (aref di 8)) (dd (aref di 9))
+                                    (as (aref si 8)) (ds (aref si 9)))
+                               (unless (zerop (+ as ds))
+                                 (/ (/ (- (- ad dd) (- as ds)) 2.0)
+                                    (float (+ as ds)))))))
+                      0))))
+    (cdr my/lsp-usage-lens--raise)))
+
 (defvar my/lsp-usage-lens--timer nil
   "Shared idle timer driving `my/lsp-usage-lens-mode' in every buffer.")
 
@@ -1417,23 +1488,43 @@ IMPLS of nil omits the implementation clause, which is how \"the server
 would not answer that\" is distinguished from a genuine zero."
   (save-excursion
     (goto-char decl-pos)
-    (let* ((bol (line-beginning-position))
-           (indent (buffer-substring-no-properties
-                    bol (save-excursion (back-to-indentation) (point))))
+    (let* ((eol (line-end-position))
            (text (format "%d usage%s%s"
                          refs (if (eql refs 1) "" "s")
                          (if impls
                              (format ", %d implementation%s"
                                      impls (if (eql impls 1) "" "s"))
                            "")))
-           (ov (make-overlay bol bol nil t nil)))
-      ;; A `before-string' ending in a newline renders on its own line
-      ;; above the declaration, which is how lsp-lens draws its own lenses
-      ;; and how GoLand places Code Vision.
-      (overlay-put ov 'before-string
-                   (concat indent
-                           (propertize text 'face 'lsp-inlay-hint-face)
-                           "\n"))
+           (ov (make-overlay eol eol nil t t)))
+      ;; An `after-string' at end of line, the way CIDER shows evaluation
+      ;; results, rather than a `before-string' ending in a newline on the
+      ;; line above.
+      ;;
+      ;; The reason is not taste.  A lens on its own line adds a screen row,
+      ;; and the drawn set changes constantly at `window' scope: replies
+      ;; arrive in batches (measured: 14 lenses in 5 batches over 483 ms),
+      ;; so every batch shifted the viewport by a row.  In dense Go that was
+      ;; one visible jump per five keystrokes, and it pushed point off the
+      ;; last window line often enough that redisplay scrolled an extra line
+      ;; to compensate.  At end of line no row is ever added, so the counts
+      ;; can appear and vanish freely without moving a single pixel.
+      ;;
+      ;; `cursor' keeps the cursor drawn before the annotation rather than
+      ;; after it when point sits at end of line.
+      ;;
+      ;; Residual: with `truncate-lines' nil a declaration whose signature
+      ;; is within ~28 columns of the right edge still wraps once the text
+      ;; is appended, which is a row appearing.  One of 67 declarations in
+      ;; the largest buffer measured, against 12 to 14 churning per pause
+      ;; before.  `truncate-lines' t would take it to zero.
+      (overlay-put ov 'after-string
+                   (concat "  " (propertize text
+                                            'face 'my/lsp-usage-lens-face
+                                            'display (list 'raise
+                                                           (my/lsp-usage-lens--raise-factor))
+                                            'cursor t)))
+      ;; Keyed by the declaration start, not by `eol', because that is what
+      ;; `my/lsp-usage-lens--update' looks up.
       (push (cons decl-pos ov) my/lsp-usage-lens--overlays))))
 
 (defun my/lsp-usage-lens--request (name-pos decl-pos want-impls)
