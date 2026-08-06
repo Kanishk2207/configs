@@ -2559,13 +2559,21 @@ so the grid and Claude agree at open; then schedule one clean redraw."
 (defun my/claude-ediff-windows (&optional frame)
   "Return (CLAUDE-WIN PANE-1 PANE-2) if a Claude ediff is laid out in FRAME.
 CLAUDE-WIN is the Claude side window; PANE-1/PANE-2 are the two diff panes
-\(non-side windows that are not the ediff control panel).  nil otherwise."
+\(non-side windows that are not the ediff control panel).  nil otherwise.
+
+Recognizes both integrations: claude-code-ide by buffer name, and agent-shell
+by major mode (its buffer name is configurable, see
+`agent-shell-buffer-name-format').  Both put their shell in a right side
+window and both clear side windows before running ediff, so the same
+three-equal-columns fix applies to either."
   (let* ((frame (or frame (selected-frame)))
          (wins (window-list frame 'no-mini))
          (wc (seq-find
               (lambda (w)
                 (and (window-parameter w 'window-side)
-                     (string-match-p "claude-code" (buffer-name (window-buffer w)))))
+                     (or (string-match-p "claude-code" (buffer-name (window-buffer w)))
+                         (eq (buffer-local-value 'major-mode (window-buffer w))
+                             'agent-shell-mode))))
               wins))
          (panes (seq-filter
                  (lambda (w)
@@ -3237,6 +3245,31 @@ re-running only re-adds specs that actually changed."
   ;; here: isearch / swiper / consult-line and region-kill work over the entire
   ;; history the moment a session is back, not just over what arrives next.
   (agent-shell-session-restore-verbosity 'full)
+  ;; Speak to Claude through the patched adapter in ~/personal/repos/, not the
+  ;; `claude-agent-acp' on PATH.  It is upstream plus `_session/rewind_points'
+  ;; and `_session/rewind', which is what makes `my/agent-shell-rewind'
+  ;; (`C-c C-; w') possible -- see that command below for why upstream has no
+  ;; rewind.  Submitted upstream as PR #966; drop this line once it lands.
+  ;;
+  ;; Two things to know.  It is a BUILD ARTIFACT: after pulling that repo, run
+  ;; `npm ci && npm run build', or this points at stale JavaScript.  And it is a
+  ;; BRANCH: the methods live on `add-rewind-function', so checking out `main'
+  ;; there silently removes rewind (the shell still works; `C-c C-; w' reports
+  ;; the method is missing).
+  ;;
+  ;; `~/.emacs.d/agent-shell-rewind/index.mjs' is the fallback, same two methods
+  ;; wrapped around whatever `claude-agent-acp' is installed globally, needing no
+  ;; build.  Either of these works, as does '("claude-agent-acp") for stock
+  ;; upstream with no rewind at all.
+  ;;
+  ;; Invoked as an ARGUMENT TO `node', not as the executable.  agent-shell
+  ;; resolves `:command' with `executable-find', which on an absolute path
+  ;; demands the execute bit -- and `tsc' writes dist/index.js mode 644, where
+  ;; npm sets 755 on a published `bin'.  `chmod +x' does survive a rebuild, but
+  ;; not a fresh clone or `rm -rf dist', so leaning on it would break this at
+  ;; the least convenient moment.  Naming `node' sidesteps the mode entirely.
+  (agent-shell-anthropic-claude-acp-command
+   (list "node" (expand-file-name "~/personal/repos/claude-agent-acp/dist/index.js")))
   ;; Permission mode for new sessions.  `default' is Claude Code's "Manual":
   ;; prompt before edits and before anything dangerous.  The alternatives the
   ;; adapter advertises are `acceptEdits', `auto', `plan', `dontAsk' and
@@ -3301,6 +3334,701 @@ Falls back to a symlink when the two ends are on different filesystems."
 (with-eval-after-load 'agent-shell
   (advice-add 'agent-shell--ensure-transcript-file
               :filter-return #'my/agent-shell-mirror-transcript))
+
+;; --- A short name for the ACP Claude starter ---
+;;
+;; The package's own name stays put -- the `:commands' autoload above, and
+;; anything else naming `agent-shell-anthropic-start-claude-code', keeps
+;; working.  This is a second, shorter entry point for `M-x' rather than a
+;; rename: a `defun' rather than a `defalias' so it carries its own docstring,
+;; and calling it pulls the package in through the same autoload stub.
+(defun start-claude-code-acp ()
+  "Start Claude Code over ACP in a new `agent-shell' buffer.
+
+Short name for `agent-shell-anthropic-start-claude-code', also on
+`C-c C-; a'.  Distinct from `claude-code-ide', which runs the Claude Code
+terminal UI in a ghostel buffer instead of speaking ACP."
+  (interactive)
+  (agent-shell-anthropic-start-claude-code))
+
+;; --- `v' on a permission prompt opens ediff, not a diff buffer ---
+;;
+;; agent-shell answers `v' with a read-only `diff-mode' buffer built by diffing
+;; the tool call's oldText against its newText.  For Claude's `Edit' tool those
+;; two fields are just `old_string' and `new_string' -- the replaced fragment,
+;; with nothing around it -- so the hunk shows exactly as much context as the
+;; agent happened to quote, and its line numbers are relative to the fragment
+;; rather than to the file.  (That is why `agent-shell-diff-open-file' has to
+;; SEARCH the file for the changed text instead of trusting them.)
+;;
+;; Replaced here with an ediff of the whole file, the way claude-code-ide's
+;; `openDiff' shows one: side A is the file as it is on disk, side B is that
+;; same file with `old_string' spliced out and `new_string' put in.  Full
+;; context, real syntax highlighting, and ediff's navigation -- `n' / `p'
+;; between changes, intra-line refinement, `|' to flip the split.
+;;
+;; Both sides are read-only COPIES, never the live file buffer.  The only two
+;; answers ACP accepts here are allow and reject, so an ediff `a' / `b' copy
+;; would either be silently discarded or -- worse -- land in the real file and
+;; make the agent's own `Edit' fail, its `old_string' no longer being there.
+;;
+;; Answering: `y' accepts, `N' rejects, `q' asks.  `q' skips ediff's own "Quit
+;; this Ediff session?" confirmation, so it is one question rather than two.
+;; Rejecting also interrupts the turn, matching agent-shell's own reject
+;; button: the agent is never told WHY a change was refused, so letting it
+;; carry on regardless is worse than stopping so you can say so.
+;;
+;; Falls back to agent-shell's built-in diff buffer whenever the whole-file
+;; view cannot be built -- an unreadable file, or an `old_string' that is not
+;; in it (already applied, or quoted from a buffer that has since moved on).
+
+(defvar my/agent-shell-ediff--sessions nil
+  "Alist of (TOOL-CALL-ID . PLIST) for permission ediffs currently open.
+PLIST carries :buffers (the two review buffers), :winconf (the window
+configuration to put back), :control (the ediff control buffer), :answer (an
+explicit `accept' / `reject' from the `y' / `N' keys) and :external (set when
+agent-shell answered the permission by some other route, so the quit handler
+must not ask about it again).")
+
+(defvar-local my/agent-shell-ediff--tool-call-id nil
+  "In an ediff control buffer, the tool call this ediff is reviewing.")
+
+(defun my/agent-shell-ediff--entry (tool-call-id)
+  "Return the registry plist for TOOL-CALL-ID, or nil."
+  (alist-get tool-call-id my/agent-shell-ediff--sessions nil nil #'equal))
+
+(defun my/agent-shell-ediff--put (tool-call-id key value)
+  "Set KEY to VALUE in the registry plist for TOOL-CALL-ID."
+  (when-let ((entry (my/agent-shell-ediff--entry tool-call-id)))
+    (setf (alist-get tool-call-id my/agent-shell-ediff--sessions nil nil #'equal)
+          (plist-put entry key value))))
+
+(defun my/agent-shell-ediff--whole-file (diff)
+  "Return (CURRENT . PROPOSED) whole-file text for DIFF, or nil.
+
+DIFF is one entry as built by `agent-shell--make-diff-infos': :file, :old,
+:new and optionally :line.  :OLD is the fragment the agent proposes to
+replace, and is empty for a `Write', where :NEW is the entire new content.
+
+Returns nil when the fragment cannot be located in the file, leaving the
+caller to fall back to agent-shell's fragment-only diff."
+  (let* ((file (alist-get :file diff))
+         (old (or (alist-get :old diff) ""))
+         (new (or (alist-get :new diff) ""))
+         (current (if (and file (file-readable-p file))
+                      (with-temp-buffer
+                        (insert-file-contents file)
+                        (buffer-string))
+                    "")))
+    (cond
+     ;; `Write': :new IS the whole file, so there is nothing to splice.
+     ((string-empty-p old)
+      (cons current new))
+     ;; No file to splice into, but a non-empty :old expects one.
+     ((string-empty-p current) nil)
+     ;; `Edit': put :new where :old is, preferring the occurrence nearest the
+     ;; ACP-reported line when there are several -- the same disambiguation
+     ;; `agent-shell-diff-open-file' does, reusing its helper.
+     (t
+      (with-temp-buffer
+        (insert current)
+        (when-let ((pos (if (fboundp 'agent-shell-diff--search-block)
+                            (agent-shell-diff--search-block old (alist-get :line diff))
+                          (progn (goto-char (point-min))
+                                 (when (search-forward old nil t)
+                                   (match-beginning 0))))))
+          (delete-region pos (+ pos (length old)))
+          (goto-char pos)
+          (insert new)
+          (cons current (buffer-string))))))))
+
+(defun my/agent-shell-ediff--header-line (side file)
+  "Return a `header-line-format' naming SIDE of FILE and the answer keys.
+
+ediff's own control panel only says \"Type ? for help\" until you toggle the
+long help, and even that never mentions `y\=' / `N\=' / `q\=', which are ours
+rather than ediff's.  agent-shell's built-in diff buffer states its keys in a
+header line; this keeps that, since the whole point of the dialog is that you
+answer it."
+  (concat " " (propertize side 'face 'mode-line-emphasis)
+          "  " (propertize (file-name-nondirectory file) 'face 'font-lock-comment-face)
+          "   " (propertize "y" 'face 'help-key-binding) " accept"
+          "   " (propertize "N" 'face 'help-key-binding) " reject"
+          "   " (propertize "q" 'face 'help-key-binding) " ask"
+          "   " (propertize "n" 'face 'help-key-binding) "/"
+          (propertize "p" 'face 'help-key-binding) " next/prev change"
+          "   " (propertize "?" 'face 'help-key-binding) " ediff help"))
+
+(defun my/agent-shell-ediff--prepare (buffer file &optional side)
+  "Fontify BUFFER as FILE's type would be, then make it read-only.
+SIDE labels the buffer in its header line.
+`buffer-file-name' is deliberately left nil: these are throw-away review
+buffers, and a file name would invite lsp-mode, flycheck, auto-save and
+save-place to treat them as the real thing."
+  (with-current-buffer buffer
+    (when-let ((mode (assoc-default file auto-mode-alist #'string-match)))
+      (when (functionp mode)
+        (condition-case err
+            (funcall mode)
+          (error
+           (message "Permission ediff: %s failed (%s), using fundamental-mode"
+                    mode (error-message-string err))
+           (fundamental-mode)))))
+    ;; AFTER the major mode, never before: a mode function begins with
+    ;; `kill-all-local-variables', which would throw the header line away.
+    (when side
+      (setq header-line-format (my/agent-shell-ediff--header-line side file)))
+    (goto-char (point-min))
+    (setq buffer-read-only t)
+    (set-buffer-modified-p nil)))
+
+(defun my/agent-shell-ediff--pick (diffs)
+  "Return the entry of DIFFS to review, asking when there is more than one.
+One tool call carries one diff for Claude's `Edit' and `Write', so the
+question only comes up for agents that batch several files into a single
+permission (Codex does)."
+  (if (cdr diffs)
+      (let ((choices (mapcar (lambda (diff)
+                               (cons (or (alist-get :file diff) "changes") diff))
+                             diffs)))
+        (cdr (assoc (completing-read "Ediff which file? " choices nil t
+                                     nil nil (caar choices))
+                    choices)))
+    (car diffs)))
+
+(defun my/agent-shell-ediff--announce-keys ()
+  "Put the permission keys into this control buffer's help panel.
+
+ediff composes its panel text from `ediff-brief-help-message-function' and
+`ediff-long-help-message-function', so overriding those buffer-locally is the
+supported way in.  Both are set: `ediff-use-long-help-message' decides which is
+shown, `?' flips between them, and the keys have to survive either.
+
+The panel is drawn during window setup, which runs BEFORE `ediff-startup-hook',
+so the text already on screen is ediff's.  Recompute and re-insert it, mirroring
+what `ediff-setup-control-buffer' does minus the window juggling.  Wrapped in
+`condition-case' because a decorative panel is not worth losing a diff over."
+  (condition-case nil
+      (let ((keys (concat " y accept   N reject   q ask"
+                          "   n/p next/prev change   ? more")))
+        (setq-local ediff-brief-help-message-function
+                    (lambda () keys))
+        (setq-local ediff-long-help-message-function
+                    (lambda ()
+                      (concat ediff-long-help-message-head
+                              ediff-long-help-message-compare2
+                              "  Tool permission:" keys "\n"
+                              ediff-long-help-message-tail)))
+        (ediff-set-help-message)
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert ediff-help-message)))
+    (error nil)))
+
+(defun my/agent-shell-ediff-quit ()
+  "Quit this permission ediff, then ask whether to accept the change.
+Bound to `q' in the control buffer of an ediff opened by `v' on a permission
+prompt.  Skips ediff's own \"Quit this Ediff session?\" confirmation, since
+the accept-or-reject question that follows already is one."
+  (interactive)
+  (ediff-barf-if-not-control-buffer)
+  (ediff-really-quit nil))
+
+(defun my/agent-shell-ediff-accept ()
+  "Accept the reviewed change and quit this permission ediff."
+  (interactive)
+  (ediff-barf-if-not-control-buffer)
+  (my/agent-shell-ediff--put my/agent-shell-ediff--tool-call-id :answer 'accept)
+  (ediff-really-quit nil))
+
+(defun my/agent-shell-ediff-reject ()
+  "Reject the reviewed change, quit this permission ediff and interrupt."
+  (interactive)
+  (ediff-barf-if-not-control-buffer)
+  (my/agent-shell-ediff--put my/agent-shell-ediff--tool-call-id :answer 'reject)
+  (ediff-really-quit nil))
+
+(defun my/agent-shell-ediff--finish (tool-call-id respond)
+  "Tear down the permission ediff for TOOL-CALL-ID and answer it via RESPOND.
+
+RESPOND is called with `accept', `reject' or `ignore'.  Runs from
+`ediff-after-quit-hook-internal' rather than `ediff-quit-hook', because
+`ediff-cleanup-mess' runs on the latter and would undo the window
+configuration we put back."
+  (let* ((entry (my/agent-shell-ediff--entry tool-call-id))
+         (external (plist-get entry :external))
+         (answer (plist-get entry :answer)))
+    ;; Drop the entry BEFORE responding: RESPOND goes through
+    ;; `agent-shell--send-permission-response', which is advised to tear down
+    ;; whatever ediff is still registered for this tool call.
+    (setf (alist-get tool-call-id my/agent-shell-ediff--sessions nil t #'equal) nil)
+    (dolist (buffer (plist-get entry :buffers))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))
+    (when-let ((winconf (plist-get entry :winconf)))
+      (ignore-errors (set-window-configuration winconf)))
+    (unless external
+      (funcall respond (or answer
+                           (condition-case nil
+                               (if (y-or-n-p "Accept changes? ") 'accept 'reject)
+                             (quit 'ignore)))))))
+
+(cl-defun my/agent-shell-ediff--start (&key diff tool-call-id shell-buffer respond)
+  "Review DIFF in ediff, answering its permission with RESPOND on quit.
+
+TOOL-CALL-ID keys the session registry, SHELL-BUFFER is put back on screen
+beside the two panes.  Returns non-nil when an ediff was started, nil when
+DIFF cannot be shown as a whole file."
+  (require 'ediff)
+  (when-let* ((texts (my/agent-shell-ediff--whole-file diff))
+              (file (or (alist-get :file diff) "changes"))
+              (name (file-name-nondirectory file)))
+    (let* ((buf-a (generate-new-buffer (format "*%s (on disk)*" name)))
+           (buf-b (generate-new-buffer (format "*%s (proposed)*" name)))
+           (winconf (current-window-configuration))
+           startup)
+      (with-current-buffer buf-a (insert (car texts)))
+      (with-current-buffer buf-b (insert (cdr texts)))
+      (my/agent-shell-ediff--prepare buf-a file "on disk")
+      (my/agent-shell-ediff--prepare buf-b file "proposed")
+      (setf (alist-get tool-call-id my/agent-shell-ediff--sessions nil nil #'equal)
+            (list :buffers (list buf-a buf-b) :winconf winconf
+                  :control nil :answer nil :external nil))
+      (setq startup
+            (lambda ()
+              (remove-hook 'ediff-startup-hook startup)
+              (when (bound-and-true-p ediff-control-buffer)
+                (my/agent-shell-ediff--put tool-call-id :control ediff-control-buffer)
+                (with-current-buffer ediff-control-buffer
+                  (setq my/agent-shell-ediff--tool-call-id tool-call-id)
+                  ;; `ediff-mode-map' is buffer-local to the control buffer
+                  ;; (`ediff-defvar-local'), so these rebindings are confined
+                  ;; to this one review and leave ordinary ediff alone.  `y'
+                  ;; and `N' are free: `suppress-keymap' bound them to
+                  ;; `undefined', and `n' / `p' stay next / previous change.
+                  (define-key ediff-mode-map "q" #'my/agent-shell-ediff-quit)
+                  (define-key ediff-mode-map "y" #'my/agent-shell-ediff-accept)
+                  (define-key ediff-mode-map "N" #'my/agent-shell-ediff-reject)
+                  (my/agent-shell-ediff--announce-keys)
+                  (add-hook 'ediff-after-quit-hook-internal
+                            (lambda ()
+                              (my/agent-shell-ediff--finish tool-call-id respond))
+                            nil t)))
+              (ignore-errors (ediff-next-difference))
+              ;; Bring the shell back beside the two panes; equal thirds then
+              ;; comes from `my/claude-ediff-equal-thirds--deferred', which
+              ;; recognizes an agent-shell side window as well as Claude's.
+              (when (buffer-live-p shell-buffer)
+                (let ((window (selected-window)))
+                  (ignore-errors (agent-shell--display-buffer shell-buffer))
+                  (when (window-live-p window)
+                    (select-window window))))
+              (message "%s" "Permission ediff: y accept, N reject, q ask, n/p next/previous change")))
+      ;; agent-shell lives in a side window, and a side window cannot be split
+      ;; -- same reason claude-code-ide clears them before its own ediff.
+      (dolist (window (window-list))
+        (when (window-parameter window 'window-side)
+          (ignore-errors (delete-window window))))
+      (add-hook 'ediff-startup-hook startup)
+      (condition-case err
+          ;; Concurrent reviews (two shells, two pending permissions) are fine:
+          ;; ediff names control buffers through `ediff-unique-buffer-name', so
+          ;; the second gets "*Ediff Control Panel*<2>" on its own.
+          (ediff-buffers buf-a buf-b)
+        (error
+         (remove-hook 'ediff-startup-hook startup)
+         (setf (alist-get tool-call-id my/agent-shell-ediff--sessions nil t #'equal) nil)
+         (mapc #'kill-buffer (list buf-a buf-b))
+         (ignore-errors (set-window-configuration winconf))
+         (signal (car err) (cdr err))))
+      t)))
+
+(defun my/agent-shell-diff-viewing-function (orig &rest args)
+  "Return a `v' handler that reviews the proposed change in ediff.
+
+`:around' advice on `agent-shell--make-diff-viewing-function'.  ORIG builds
+agent-shell's own `diff-mode' buffer, which stays as the fallback for
+anything ediff cannot render as a whole file."
+  (let* ((fallback (apply orig args))
+         (diffs (plist-get args :diffs))
+         (actions (plist-get args :actions))
+         (client (plist-get args :client))
+         (request-id (plist-get args :request-id))
+         (state (plist-get args :state))
+         (tool-call-id (plist-get args :tool-call-id))
+         (shell-buffer (current-buffer)))
+    (lambda ()
+      (interactive)
+      (if-let* ((entry (my/agent-shell-ediff--entry tool-call-id))
+                (control (plist-get entry :control))
+                ((buffer-live-p control)))
+          ;; Already reviewing this one -- go back to it rather than stacking
+          ;; a second ediff on the same permission.
+          (pop-to-buffer control)
+        (let ((respond
+               (lambda (choice)
+                 (if-let ((action (agent-shell--resolve-permission-choice-to-action
+                                   :choice choice :actions actions)))
+                     (with-current-buffer shell-buffer
+                       (agent-shell--send-permission-response
+                        :client client
+                        :request-id request-id
+                        :option-id (alist-get :option-id action)
+                        :state state
+                        :tool-call-id tool-call-id
+                        :message-text (alist-get :option action))
+                       ;; The agent is not told why a change was refused, so
+                       ;; letting it carry on is worse than stopping here.
+                       (when (eq choice 'reject)
+                         (agent-shell-interrupt t)))
+                   (message "Ignored")))))
+          (unless (my/agent-shell-ediff--start
+                   :diff (my/agent-shell-ediff--pick diffs)
+                   :tool-call-id tool-call-id
+                   :shell-buffer shell-buffer
+                   :respond respond)
+            (funcall fallback)))))))
+
+(defun my/agent-shell-ediff-teardown (&rest args)
+  "Close the permission ediff for this tool call, if one is open.
+
+`:before' advice on `agent-shell--send-permission-response', mirroring what
+agent-shell does there with its own diff buffer.  A permission can be
+answered from the shell buffer, or cancelled by an interrupt, while the
+review is still up; a stale ediff of a decided change is worse than none.
+Marks the entry `:external' first so the quit handler does not ask about a
+permission that has already been answered."
+  (when-let* ((tool-call-id (plist-get args :tool-call-id))
+              (entry (my/agent-shell-ediff--entry tool-call-id)))
+    (my/agent-shell-ediff--put tool-call-id :external t)
+    (let ((control (plist-get entry :control)))
+      (if (buffer-live-p control)
+          (condition-case nil
+              (with-current-buffer control
+                (ediff-really-quit nil))
+            ;; `ediff-really-quit' failing leaves the review buffers behind, so
+            ;; run the teardown by hand.  `:external' makes it silent.
+            (error (my/agent-shell-ediff--finish tool-call-id #'ignore)))
+        (my/agent-shell-ediff--finish tool-call-id #'ignore)))))
+
+(with-eval-after-load 'agent-shell
+  (advice-add 'agent-shell--make-diff-viewing-function
+              :around #'my/agent-shell-diff-viewing-function)
+  (advice-add 'agent-shell--send-permission-response
+              :before #'my/agent-shell-ediff-teardown))
+
+;; --- `/rewind': put the files back the way they were ---
+;;
+;; The CLI's Esc-Esc / `/rewind' restores files to their state at an earlier
+;; user message.  Nothing in ACP exposes it: the Claude Agent SDK has
+;; `Query.rewindFiles', gated behind `enableFileCheckpointing', but
+;; claude-agent-acp sets neither and registers no method that reaches it.  Its
+;; own source admits as much, on `Session.messageIdToUuid': "NOT READ YET --
+;; recorded now so the mapping exists if/when we wire up fork/rewind".
+;;
+;; So the missing piece is added on the agent side, by
+;; `~/.emacs.d/agent-shell-rewind/index.mjs' (JavaScript -- the adapter is a
+;; Node program, not Lisp).  It re-exports the stock adapter's whole handler
+;; chain plus `_session/rewind_points' and `_session/rewind', and forces
+;; checkpointing on.  `agent-shell-anthropic-claude-acp-command' above points
+;; at it.  Read that file's header before upgrading the adapter.
+;;
+;; The Emacs half needs nothing from agent-shell or acp.el, because an acp.el
+;; request is just an alist of `:method' and `:params' -- any method name goes
+;; over the wire, extension or not.
+;;
+;; What this does NOT do: rewind the conversation.  Only files move.  Claude
+;; still believes it made the edits, which is usually what you want (tell it
+;; what was wrong and it tries again from a clean tree), but it is the half
+;; `agent-shell-fork' complements -- files back here, conversation branched.
+
+;; The buffer surgery below walks `comint-prompt-regexp'.  agent-shell pulls
+;; comint in through shell-maker, but say so explicitly rather than lean on
+;; another package's load order.
+(require 'comint)
+
+(defun my/agent-shell-rewind--revert (files)
+  "Revert any live buffer visiting one of FILES, discarding its contents.
+A rewind changes files under Emacs, so a buffer left alone would still show
+the rewound-away version and write it back on the next save.  Buffers with
+unsaved changes are left alone and named, since those edits are yours rather
+than the agent's and a rewind was not a request to throw them away."
+  (let (reverted kept)
+    (dolist (file files)
+      (when-let ((buffer (find-buffer-visiting file)))
+        (with-current-buffer buffer
+          (if (buffer-modified-p)
+              (push (buffer-name) kept)
+            (ignore-errors
+              (revert-buffer :ignore-auto :noconfirm :preserve-modes)
+              (push (buffer-name) reverted))))))
+    (cons (nreverse reverted) (nreverse kept))))
+
+(defun my/agent-shell-rewind--report (result files &optional dropped-turns)
+  "Message the outcome of a rewind RESULT that touched FILES.
+Reports only the halves the chosen mode actually ran, so a conversation-only
+rewind does not announce zero files.  DROPPED-TURNS is how many rendered turns
+were deleted from the buffer, or nil when none could be matched."
+  (let* ((files-part (alist-get 'files result))
+         (conv-part (alist-get 'conversation result))
+         (reverted-kept (my/agent-shell-rewind--revert files))
+         (skipped (or (alist-get 'skippedLinks files-part) 0)))
+    (message
+     "%s"
+     (string-join
+      (delq nil
+            (list
+             (when files-part
+               (format "Restored %d file(s)%s%s%s"
+                       (length files)
+                       (if (> skipped 0)
+                           (format ", %d skipped for link safety" skipped)
+                         "")
+                       (if (car reverted-kept)
+                           (format ", reverted %d buffer(s)" (length (car reverted-kept)))
+                         "")
+                       (if (cdr reverted-kept)
+                           (format ", LEFT ALONE (unsaved): %s"
+                                   (string-join (cdr reverted-kept) ", "))
+                         "")))
+             (cond ((null conv-part) nil)
+                   ((eq (alist-get 'rewound conv-part) t)
+                    (format (concat "Claude has forgotten the last %d message(s)"
+                                    "; %s.  Do NOT restart or resume before your"
+                                    " next prompt, or the rewind is lost")
+                            (or (alist-get 'messagesDropped conv-part) 0)
+                            (if dropped-turns
+                                (format "removed %d turn(s) from this buffer"
+                                        dropped-turns)
+                              "the buffer above still shows them")))
+                   (t (format "conversation NOT rewound: %s"
+                              (or (alist-get 'error conv-part) "refused"))))))
+      "; "))))
+
+(defun my/agent-shell-rewind--blocker (files-part conv-part)
+  "Return why a previewed rewind cannot proceed, or nil when it can.
+FILES-PART and CONV-PART are the two halves of a `dryRun' response; each is
+absent when the chosen mode did not ask for it."
+  (cond
+   ((and files-part (not (eq (alist-get 'canRewind files-part) t)))
+    (or (alist-get 'error files-part) "no checkpoint for that message"))
+   ;; The conversation half reports `rewound: nil' on every dry run, so only
+   ;; an explicit :error means it would refuse.
+   ((and conv-part (alist-get 'error conv-part))
+    (alist-get 'error conv-part))))
+
+(defun my/agent-shell-rewind--summary (files dropped files-part)
+  "Describe a pending rewind of FILES and DROPPED messages for confirmation.
+FILES-PART carries the insertion/deletion counts, when files are in scope."
+  (string-join
+   (delq nil
+         (list (when files
+                 (format "Restore %d file(s) (+%s/-%s): %s"
+                         (length files)
+                         (or (alist-get 'insertions files-part) 0)
+                         (or (alist-get 'deletions files-part) 0)
+                         (string-join (mapcar #'file-name-nondirectory files) ", ")))
+               (when (> dropped 0)
+                 (format "drop %d message(s) from the conversation, permanently"
+                         dropped))))
+   ", and "))
+
+(defun my/agent-shell-rewind--normalize (text)
+  "Collapse TEXT to the shape the agent reports rewind-point text in."
+  (string-trim (replace-regexp-in-string "[ \t\n\r]+" " " (or text ""))))
+
+(defun my/agent-shell-rewind--turn-starts ()
+  "Return an alist of (POSITION . INPUT) for each submitted turn in this buffer.
+
+POSITION is where that turn\='s `comint\=' prompt begins; INPUT is the text the
+user submitted at it, normalized like `my/agent-shell-rewind--normalize\='.
+The trailing live prompt is excluded: it has no
+`<shell-maker-end-of-prompt>\=' delimiter yet, having not been submitted."
+  (save-excursion
+    (goto-char (point-min))
+    (let (turns)
+      (while (re-search-forward comint-prompt-regexp nil t)
+        (let ((begin (match-beginning 0))
+              (input-start (point))
+              (input-end (save-excursion
+                           (when (re-search-forward "<shell-maker-end-of-prompt>" nil t)
+                             (match-beginning 0)))))
+          (when input-end
+            (push (cons begin
+                        (my/agent-shell-rewind--normalize
+                         (buffer-substring-no-properties input-start input-end)))
+                  turns))))
+      (nreverse turns))))
+
+(defun my/agent-shell-rewind--drop-turns-from (text)
+  "Delete every rendered turn from the one whose input matches TEXT onwards.
+
+TEXT is a rewind point\='s reported text, which the agent truncates, so the
+match is a prefix test against each turn\='s submitted input.  Deletion stops
+short of the trailing live prompt, which comint\='s process mark sits in and
+which the shell needs to keep accepting input.
+
+Returns the number of turns removed, or nil when no turn matched -- in which
+case nothing is touched, since removing the wrong region of a conversation is
+worse than leaving a stale one on screen."
+  (let* ((turns (my/agent-shell-rewind--turn-starts))
+         (target (my/agent-shell-rewind--normalize text))
+         (hit (seq-find (lambda (turn)
+                          (string-prefix-p target (cdr turn)))
+                        turns)))
+    (when hit
+      (let ((last-prompt (save-excursion
+                           (goto-char (point-max))
+                           (when (re-search-backward comint-prompt-regexp nil t)
+                             (match-beginning 0)))))
+        (when (and last-prompt (< (car hit) last-prompt))
+          (let ((inhibit-read-only t))
+            (delete-region (car hit) last-prompt))
+          (length (seq-filter (lambda (turn) (>= (car turn) (car hit))) turns)))))))
+
+(defun my/agent-shell-rewind--error (label error-data)
+  "Report ERROR-DATA from a rewind request labelled LABEL."
+  (let ((code (alist-get 'code error-data))
+        (text (alist-get 'message error-data)))
+    (if (equal code -32601)
+        (user-error
+         "Agent has no %s method.  This shell is talking to a stock adapter: check \
+`agent-shell-anthropic-claude-acp-command', that the fork is built and on its \
+add-rewind-function branch, and that the shell was started after that" label)
+      (user-error "%s failed: %s (%s)" label (or text "unknown error") code))))
+
+(defconst my/agent-shell-rewind-modes
+  '(("code and conversation" . "both")
+    ("code only" . "files")
+    ("conversation only" . "conversation"))
+  "What `my/agent-shell-rewind' can undo, in the order it offers them.
+Mirrors the choice the Claude Code CLI's `/rewind' presents.  \"code and
+conversation\" is first because it is the one that leaves no contradiction
+behind: the other two deliberately desynchronize the tree from what the agent
+believes about it.")
+
+(defun my/agent-shell-rewind ()
+  "Rewind this session to an earlier prompt: the code, the conversation, or both.
+
+Asks which, lists this session's own prompts, previews what would change, and
+only then does it -- the same shape as the CLI's `/rewind'.
+
+The two halves are not the same operation.  Rewinding the CODE restores files
+from the agent's checkpoints and leaves the conversation intact, so Claude
+still believes it made the edits.  Rewinding the CONVERSATION truncates the
+transcript, so those turns leave its context for good; it cannot go back past
+the first prompt, having nothing to resume at.  Rewinding BOTH is the CLI's
+default and the only one that leaves tree and memory agreeing.
+
+Buffers visiting changed files are reverted; ones with unsaved changes are
+left alone and named.
+
+A conversation rewind removes the dropped turns from this buffer by deleting
+their text, NOT by reloading the session.  That distinction matters: the
+truncation lives in the agent's running query and only reaches the transcript
+on disk when you send the next prompt, so anything that restarts the ACP
+connection -- `agent-shell-restart', `agent-shell-resume-session', killing the
+buffer -- resumes the FULL history from disk and silently undoes the rewind.
+Deleting text locally touches nothing on the wire, so it is safe.  Send the
+next prompt to make the rewind permanent.
+
+When no rendered turn matches the chosen prompt the buffer is left untouched
+and says so, since removing the wrong stretch of a conversation is worse than
+leaving a stale one on screen.
+
+Needs the patched adapter -- see `agent-shell-anthropic-claude-acp-command'."
+  (declare (modes agent-shell-mode))
+  (interactive)
+  (let* ((shell-buffer (or (agent-shell--current-shell)
+                           (user-error "Not in a shell or viewport buffer")))
+         (state (buffer-local-value 'agent-shell--state shell-buffer))
+         (client (map-elt state :client))
+         (session-id (map-nested-elt state '(:session :id))))
+    (unless session-id
+      (user-error "No active session to rewind"))
+    (let ((mode (cdr (assoc (completing-read "Rewind what? "
+                                             my/agent-shell-rewind-modes nil t)
+                            my/agent-shell-rewind-modes))))
+    (acp-send-request
+     :client client
+     :buffer shell-buffer
+     :request `((:method . "_session/rewind_points")
+                (:params . ((sessionId . ,session-id))))
+     :on-failure (lambda (error-data &rest _)
+                   (my/agent-shell-rewind--error "_session/rewind_points" error-data))
+     :on-success
+     (lambda (response)
+       (let* ((points (append (alist-get 'points response) nil))
+              ;; A conversation rewind resumes at the assistant message before
+              ;; the prompt, so the first prompt of a session is not a legal
+              ;; target.  Filter it out rather than offer a choice the agent
+              ;; will refuse.
+              (points (if (equal mode "files")
+                          points
+                        (seq-filter (lambda (point)
+                                      (alist-get 'resumeAtMessageId point))
+                                    points)))
+              ;; Newest first: rewinding is nearly always "undo what just
+              ;; happened", and that prompt is at the end of the transcript.
+              (choices (nreverse
+                        (mapcar (lambda (point)
+                                  (cons (format "%2d. %s"
+                                                (alist-get 'index point)
+                                                (alist-get 'text point))
+                                        point))
+                                points))))
+         (unless choices
+           (user-error "%s" (if (equal mode "files")
+                                "No rewind points yet in this session"
+                                "Nothing to rewind to: a conversation rewind needs a prompt before this one")))
+         (let* ((chosen (cdr (assoc (completing-read "Rewind to before: "
+                                                     choices nil t)
+                                    choices)))
+                (message-id (alist-get 'messageId chosen))
+                (chosen-text (alist-get 'text chosen)))
+           ;; Always preview first.  A rewind overwrites the working tree, and
+           ;; `dryRun' is the only way to see how much before committing to it.
+           (acp-send-request
+            :client client
+            :buffer shell-buffer
+            :request `((:method . "_session/rewind")
+                       (:params . ((sessionId . ,session-id)
+                                   (messageId . ,message-id)
+                                   (mode . ,mode)
+                                   (dryRun . t))))
+            :on-failure (lambda (error-data &rest _)
+                          (my/agent-shell-rewind--error "_session/rewind" error-data))
+            :on-success
+            (lambda (preview)
+              (let* ((files-part (alist-get 'files preview))
+                     (conv-part (alist-get 'conversation preview))
+                     (files (append (alist-get 'filesChanged files-part) nil))
+                     (dropped (or (alist-get 'messagesDropped conv-part) 0))
+                     (blocker (my/agent-shell-rewind--blocker files-part conv-part)))
+                (cond
+                 (blocker (user-error "Cannot rewind: %s" blocker))
+                 ((and (null files) (zerop dropped))
+                  (message "Nothing to rewind: nothing changed since then"))
+                 ((y-or-n-p (concat (my/agent-shell-rewind--summary files dropped files-part) "? "))
+                  (acp-send-request
+                   :client client
+                   :buffer shell-buffer
+                   :request `((:method . "_session/rewind")
+                              (:params . ((sessionId . ,session-id)
+                                          (messageId . ,message-id)
+                                          (mode . ,mode))))
+                   :on-failure (lambda (error-data &rest _)
+                                 (my/agent-shell-rewind--error "_session/rewind" error-data))
+                   :on-success
+                   (lambda (result)
+                     (let ((dropped
+                            (when (eq (alist-get 'rewound
+                                                 (alist-get 'conversation result))
+                                      t)
+                              (with-current-buffer shell-buffer
+                                (my/agent-shell-rewind--drop-turns-from chosen-text)))))
+                       (my/agent-shell-rewind--report result files dropped)))))
+                 (t (message "Rewind cancelled")))))))))))))
 
 ;; --- agent-shell companions ---
 
@@ -3404,14 +4132,34 @@ Targets a live agent-shell if there is one, else a claude-code-ide session."
 ;; major-mode binding, so nothing shadows them in a code buffer.
 (defvar my/agent-shell-map
   (let ((m (make-sparse-keymap)))
-    (define-key m (kbd "a") #'agent-shell-anthropic-start-claude-code)
+    (define-key m (kbd "a") #'start-claude-code-acp)
     (define-key m (kbd "b") #'agent-shell-switch-buffer)
     (define-key m (kbd "n") #'agent-shell-new-shell)
-    ;; Branch the conversation from here into a new shell, leaving this one
-    ;; intact.  The nearest thing ACP offers to the CLI's Esc-Esc rewind, which
-    ;; the adapter does not expose yet (issue #583).
+    ;; Branch the conversation from HERE (the end of it) into a new shell,
+    ;; leaving this one intact.  `session/fork' is `session/resume' with the
+    ;; SDK's `forkSession: true': the adapter mints a fresh session id and
+    ;; copies the old transcript into it, so the new session's Claude knows the
+    ;; whole conversation and writes only to the new id.
+    ;;
+    ;; The new BUFFER looks empty -- just "✓ Forked session <uuid>" -- and that
+    ;; is display only, not lost context.  agent-shell replays history through
+    ;; `session/load' (see `agent-shell-session-restore-verbosity' above), and
+    ;; `agent-shell--initiate-session-fork-by-id' does not call it; only the
+    ;; resume path does.  Ask the fork anything about the earlier conversation
+    ;; and it answers.  `C-c C-; t' opens the parent's transcript to read back.
+    ;;
+    ;; NOT a rewind: forking cannot pick a point mid-conversation, and it does
+    ;; not touch files.  The CLI's Esc-Esc / `/rewind' has no ACP equivalent --
+    ;; the SDK has `Query.rewindFiles' behind `enableFileCheckpointing', but
+    ;; claude-agent-acp registers no method for it (see agent-shell issue #583,
+    ;; and the "NOT READ YET" note on `messageIdToUuid' in its acp-agent.d.ts).
     (define-key m (kbd "f") #'agent-shell-fork)
     (define-key m (kbd "r") #'agent-shell-resume-session)
+    ;; The other half of the CLI's Esc-Esc: put the FILES back to how they were
+    ;; at an earlier prompt.  Needs the wrapper adapter (see
+    ;; `agent-shell-anthropic-claude-acp-command'); does not touch the
+    ;; conversation, so pair it with `f' when you want both rewound.
+    (define-key m (kbd "w") #'my/agent-shell-rewind)
     ;; Every session is also written to <project>/.agent-shell/transcripts/*.md
     ;; as it happens, so past conversations are grep-able across projects.
     (define-key m (kbd "t") #'agent-shell-open-transcript)
@@ -4318,7 +5066,540 @@ sweep, and the same thing CI would run."
   (define-key yaml-ts-mode-map (kbd "C-c G l") #'my/gh-actions-lint-project))
 
 ;; ============================================================
-;; 12. Theme (kept last: everything it themes is configured above)
+;; 12. Markdown editing
+;; ============================================================
+
+(use-package markdown-mode
+  :ensure t
+  :defer t
+  :config
+  ;; Fontify fenced code blocks in their own language.
+  (setq markdown-fontify-code-blocks-natively t
+        markdown-hide-urls nil
+        markdown-header-scaling t)
+  ;; Both preview commands live in section 13.
+  (define-key markdown-mode-map (kbd "C-c m r") #'my/markdown-toggle-render)
+  (define-key markdown-mode-map (kbd "C-c m g") #'grip-mode))
+
+;; ============================================================
+;; 13. Markdown preview: a real browser, in an Emacs window
+;; ============================================================
+;;
+;; Emacs's display engine lays characters into lines and decorates them.
+;; It has no box model, so it cannot pad table cells into columns or draw
+;; rules around them, and an in-buffer "rendered" Markdown view is
+;; therefore always going to be a decorated version of the source rather
+;; than a rendered document.  This section stops trying and hands the job
+;; to an actual browser, which is also exactly what VS Code does: parse
+;; to HTML, display it in a webview next to the text.
+;;
+;; `go-grip' is the renderer, a Go binary serving GitHub-styled HTML on
+;; localhost, offline, with no GitHub API call and so no rate limit or
+;; token.  `grip-mode' starts it and points an Emacs xwidget at it.
+;;
+;; Two commands, both toggles:
+;;
+;;   C-c m r  `my/markdown-toggle-render' -- replaces the text in THIS
+;;            window with the rendered page, and puts the text back when
+;;            run again.  The preview keeps running in between, so
+;;            flipping is instant.
+;;   C-c m g  `grip-mode' -- the same preview beside the text.
+;;
+;; In the preview, `q' closes it and `C-c m r' flips back.  `C-s' and
+;; `C-r' run `xwidget-webkit-isearch-mode', WebKit's own find, and
+;; `xwidget-webkit-copy-selection-as-kill' yanks a selection back out
+;; into Emacs.  Those two are built in and need no configuration.
+;;
+;; Everything here was verified on this machine rather than assumed: the
+;; xwidget paints, `xwidget-webkit-execute-script' runs JavaScript and
+;; calls back into Emacs with the result, go-grip gives headings
+;; GitHub-style anchor ids, and its live reload is a WebSocket firing a
+;; plain `location.reload()' which throws away the scroll position.
+;;
+;; The preview follows the window, not the cursor: it shows the lines you
+;; are looking at, and reading scrolls the window without moving point at
+;; all.  go-grip emits no `data-line' attributes, so the served copy gets
+;; line anchors stamped into it to make that mapping exact -- see the
+;; line anchors block below for why heading-matching was not good enough.
+;;
+;; An earlier version of this section also had an in-buffer renderer and
+;; a native side preview built on `markdown-view-mode'.  Both are gone.
+;; The side preview rebuilt a 31k document, realigned its 21 tables and
+;; refontified the lot on every refresh, which was slow enough to stall
+;; the frame, and fontifying that buffer in one pass also throws
+;; `integer-or-marker-p, nil' from markdown-mode's own
+;; `markdown-match-italic'.  Not worth curing when a browser is one
+;; keystroke away.
+;;
+;; Live refresh writes a sibling `<name>.temp.md'.  grip deletes it when
+;; the preview stops, and on `kill-buffer' and `kill-emacs', so it only
+;; outlives a crash, but it is visible to `git status' while previewing.
+;; Add `*.temp.md' to the repo's .git/info/exclude if that bothers you.
+
+(defvar my/grip-refresh-idle-delay 0.4
+  "Idle seconds before a change is written to grip's preview file.
+grip hangs its refresh straight off `after-change-functions', which is
+one whole-file write per keystroke; this is the debounce.")
+
+(defvar my/grip-sync-interval 0.06
+  "Minimum seconds between preview scroll updates.
+A throttle, not a debounce: waiting for idle is what made the preview
+sit still until you stopped moving.")
+
+(defvar my/grip-reload-settle-delay 0.5
+  "Seconds to wait after a refresh before re-syncing the scroll position.
+Long enough for go-grip to notice the write, push its reload over the
+WebSocket, and for the page to come back with a populated DOM.")
+
+(defvar-local my/grip--session nil
+  "In a Markdown buffer: the xwidget session showing its preview.")
+
+(defvar-local my/grip--source nil
+  "In a preview buffer: the Markdown buffer it belongs to.")
+
+(defvar-local my/grip--refresh-timer nil)
+(defvar-local my/grip--sync-timer nil)
+(defvar-local my/grip--last-sync 0.0)
+
+(defun my/grip--slug (heading)
+  "Return the anchor id go-grip generates for HEADING.
+Derived by testing its output, not from documentation: characters that
+are not alphanumeric, space, underscore or hyphen are dropped, then
+every remaining space and underscore becomes one hyphen.  So `### 9.6
+Rollback' is `96-rollback', and `## **Bold** and _under_score_' is
+`bold-and--under-score-' -- note the doubled hyphen, which is why the
+substitution is per character and not per run."
+  (let ((s (downcase (string-trim heading))))
+    (setq s (replace-regexp-in-string "[^[:alnum:] _-]" "" s))
+    (replace-regexp-in-string "[ _]" "-" s)))
+
+(defun my/grip--heading-search (direction)
+  "Find the nearest Markdown heading in DIRECTION (`up' or `down').
+Return a cons of its slug and its line number, or nil.  Headings inside
+fenced code blocks do not count."
+  (save-excursion
+    (let ((search (if (eq direction 'up)
+                      #'re-search-backward
+                    #'re-search-forward))
+          (regexp "^[ \t]*#+[ \t]+\\(.*\\)$")
+          result)
+      (when (eq direction 'up) (end-of-line))
+      (while (and (not result) (funcall search regexp nil t))
+        (unless (markdown-code-block-at-point-p)
+          (setq result (cons (my/grip--slug (match-string-no-properties 1))
+                             (line-number-at-pos (point) t)))))
+      result)))
+
+(defun my/grip--sync-line ()
+  "Source line the preview should put at the top of its viewport.
+The first line the window is showing, not the line point is on.  Those
+are different things: reading scrolls the window without moving point at
+all, and a preview that chases the cursor shows you somewhere you are
+not looking."
+  (let ((window (get-buffer-window (current-buffer))))
+    (line-number-at-pos (if window (window-start window) (point)) t)))
+
+;; --- line anchors ------------------------------------------------------
+;;
+;; go-grip emits no `data-line' attributes, so nothing in the rendered
+;; page says which source line a given pixel came from.  Matching by
+;; heading and interpolating between headings by line count was the first
+;; attempt, and it drifts badly here: a twelve-row table is fourteen
+;; source lines but renders tall, while one long wrapped paragraph is a
+;; single source line.  In a document this table-heavy the guess is wrong
+;; by whole screens.
+;;
+;; The served file is ours, though.  grip previews a `<name>.temp.md'
+;; copy, so stamping zero-height anchors into that copy costs nothing and
+;; gives the page real line coordinates -- the same thing VS Code gets
+;; from markdown-it's `data-line' attributes.
+;;
+;; Anchors go only at block starts (a non-blank line following a blank
+;; one) and only outside fenced code.  A `<div>' is an HTML block, which
+;; runs to the next blank line, so the blank line after each anchor is
+;; load-bearing: without it the following paragraph gets swallowed into
+;; raw HTML and never renders as Markdown.  Lines starting with a list
+;; marker are skipped, because an HTML block between two items of a loose
+;; list splits it in two and restarts the numbering.
+
+(defvar-local my/grip--anchor-lines nil
+  "Sorted source lines that carry an anchor in the served copy.")
+
+(defun my/grip--anchorable-p (line)
+  "Non-nil if an anchor can be placed before LINE without changing output."
+  (not (string-match-p "\\`\\([ \t]\\|[-*+][ \t]\\|[0-9]+[.)][ \t]\\)" line)))
+
+(defun my/grip--anchored-string ()
+  "Return this buffer's text with line anchors, recording their lines."
+  (let ((lines (split-string (buffer-substring-no-properties (point-min) (point-max))
+                             "\n"))
+        (number 0)
+        (in-fence nil)
+        (previous-blank t)
+        anchors
+        out)
+    (dolist (line lines)
+      (setq number (1+ number))
+      (let ((blank (string-match-p "\\`[ \t]*\\'" line))
+            (fence (string-match-p "\\`[ \t]*\\(```\\|~~~\\)" line)))
+        (when (and (not in-fence) (not blank) previous-blank
+                   (my/grip--anchorable-p line))
+          (push number anchors)
+          (push (format "<div id=\"mdline-%d\" style=\"height:0;margin:0\"></div>"
+                        number)
+                out)
+          (push "" out))
+        (when fence (setq in-fence (not in-fence)))
+        (push line out)
+        (setq previous-blank (and blank t))))
+    (setq my/grip--anchor-lines (nreverse anchors))
+    (mapconcat #'identity (nreverse out) "\n")))
+
+(defun my/grip--write-preview-file ()
+  "Write the anchored copy of this buffer to grip's preview file.
+Refuses when the preview file is the real file, which is what grip uses
+when `grip-real-time-refresh' is off.  Stamping anchors into the
+document you are editing would be unforgivable."
+  (when (and (bound-and-true-p grip--preview-file)
+             buffer-file-name
+             (not (string-equal grip--preview-file buffer-file-name)))
+    (write-region (my/grip--anchored-string) nil grip--preview-file nil 'quiet)))
+
+(defun my/grip--anchors-around (line)
+  "Return (BEFORE . AFTER), the anchor lines bracketing LINE."
+  (let ((before nil) (after nil) (remaining my/grip--anchor-lines))
+    (while (and remaining (<= (car remaining) line))
+      (setq before (car remaining) remaining (cdr remaining)))
+    (setq after (car remaining))
+    (and before (cons before after))))
+
+(defconst my/grip--scroll-js
+  "(function(a,b,f){\
+var e=document.getElementById(a);\
+if(!e){return \"no-anchor\";}\
+var top=e.getBoundingClientRect().top+window.scrollY;\
+var n=b?document.getElementById(b):null;\
+var span=n?((n.getBoundingClientRect().top+window.scrollY)-top):0;\
+window.scrollTo(0,Math.max(0,top+span*f-24));\
+return \"ok\";})(%S,%s,%s)"
+  "Put anchor A at the top of the page, F of the way toward anchor B.
+Interpolating between two anchors is what makes the match continuous
+instead of jumping block to block.  The scroll is deliberately instant:
+smooth scrolling lags behind and never catches up.")
+
+(defun my/grip--sync-targets (line)
+  "Return (ID-A ID-B . FRACTION) placing source LINE at the viewport top.
+Uses the stamped line anchors when the served copy has them, and falls
+back to headings when it does not, which is the case when
+`grip-real-time-refresh' is off and grip is serving the real file."
+  (if my/grip--anchor-lines
+      (let ((pair (my/grip--anchors-around line)))
+        (when pair
+          (let* ((before (car pair))
+                 (after (cdr pair))
+                 (span (and after (max 1 (- after before))))
+                 (fraction (if span
+                               (min 1.0 (max 0.0 (/ (float (- line before))
+                                                    span)))
+                             0.0)))
+            (list (format "mdline-%d" before)
+                  (and after (format "mdline-%d" after))
+                  fraction))))
+    (save-excursion
+      (goto-char (point-min))
+      (forward-line (1- line))
+      (let ((current (my/grip--heading-search 'up)))
+        (when current
+          (let* ((next (save-excursion
+                         (goto-char (point-min))
+                         (forward-line (cdr current))
+                         (my/grip--heading-search 'down)))
+                 (span (max 1 (- (or (cdr next)
+                                     (line-number-at-pos (point-max) t))
+                                 (cdr current))))
+                 (fraction (min 1.0 (max 0.0 (/ (float (- line (cdr current)))
+                                                span)))))
+            (list (car current) (car next) fraction)))))))
+
+(defun my/grip-sync-scroll (&optional retrying)
+  "Scroll the preview so it shows what the window is showing.
+RETRYING guards the one retry we allow: a reload can land between the
+write and this call, and the anchor is then not in the DOM yet."
+  (interactive)
+  (when (and my/grip--session
+             (xwidget-live-p my/grip--session)
+             (derived-mode-p 'markdown-mode))
+    (let* ((line (my/grip--sync-line))
+           (targets (my/grip--sync-targets line))
+           (buffer (current-buffer)))
+      (when targets
+        (xwidget-webkit-execute-script
+         my/grip--session
+         (format my/grip--scroll-js
+                 (nth 0 targets)
+                 (if (nth 1 targets) (format "%S" (nth 1 targets)) "null")
+                 (nth 2 targets))
+         (lambda (result)
+           (when (and (equal result "no-anchor") (not retrying))
+             (run-with-timer
+              my/grip-reload-settle-delay nil
+              (lambda ()
+                (when (buffer-live-p buffer)
+                  (with-current-buffer buffer
+                    (my/grip-sync-scroll t))))))))))))
+
+(defun my/grip--sync-later ()
+  "Queue a single trailing sync for the current buffer."
+  (let ((buffer (current-buffer)))
+    (when (timerp my/grip--sync-timer) (cancel-timer my/grip--sync-timer))
+    (setq my/grip--sync-timer
+          (run-with-timer
+           my/grip-sync-interval nil
+           (lambda ()
+             (when (buffer-live-p buffer)
+               (with-current-buffer buffer
+                 (setq my/grip--last-sync (float-time))
+                 (my/grip-sync-scroll))))))))
+
+(defun my/grip--schedule-sync ()
+  "Keep the preview showing whatever the window is showing.
+Throttled rather than debounced: the first movement scrolls the page
+immediately and further movement scrolls at most every
+`my/grip-sync-interval', with one trailing update so the final position
+always lands.  Each update is one asynchronous JavaScript call, so the
+cost of running often is small."
+  (when my/grip--session
+    (let ((now (float-time)))
+      (if (>= (- now my/grip--last-sync) my/grip-sync-interval)
+          (progn (setq my/grip--last-sync now)
+                 (my/grip-sync-scroll))
+        (my/grip--sync-later)))))
+
+(defun my/grip--sync-after-scroll (&rest _)
+  "Queue a sync from `window-scroll-functions'.
+Always deferred, never inline: that hook runs inside redisplay, which is
+no place to call into WebKit."
+  (when my/grip--session
+    (my/grip--sync-later)))
+
+(defun my/grip--refresh-debounced (_original &rest _args)
+  "Replace grip's per-keystroke write of the preview file.
+Two changes to what grip does.  It writes on every single change, which
+is a whole-file write per keystroke, so this waits for a pause.  And it
+writes the buffer verbatim, where this writes the anchored copy, so the
+page keeps its line coordinates.  ORIGINAL is therefore never called.
+Re-syncs afterwards, because the reload a write triggers resets the page
+to the top."
+  (let ((buffer (current-buffer)))
+    (when (timerp my/grip--refresh-timer) (cancel-timer my/grip--refresh-timer))
+    (setq my/grip--refresh-timer
+          (run-with-idle-timer
+           my/grip-refresh-idle-delay nil
+           (lambda ()
+             (when (buffer-live-p buffer)
+               (with-current-buffer buffer
+                 (my/grip--write-preview-file)
+                 (run-with-timer
+                  my/grip-reload-settle-delay nil
+                  (lambda ()
+                    (when (buffer-live-p buffer)
+                      (with-current-buffer buffer
+                        (my/grip-sync-scroll))))))))))))
+
+(defun my/grip--capture-session (original url)
+  "Record which xwidget session belongs to this buffer's preview.
+Run as :around advice because grip's own display function leaves the
+xwidget buffer current, so :after advice would store the session in the
+wrong buffer.  Recording it once also avoids calling
+`xwidget-webkit-current-url' on every sync, which prints to the echo
+area."
+  (let ((source (current-buffer)))
+    ;; grip seeds the preview by copying the file on disk, so the first
+    ;; page has no anchors and no unsaved edits.  Replace it before the
+    ;; widget loads.
+    (with-current-buffer source (my/grip--write-preview-file))
+    (prog1 (funcall original url)
+      (when (and (buffer-live-p source)
+                 (fboundp 'xwidget-webkit-current-session))
+        (let* ((session (xwidget-webkit-current-session))
+               (preview (and session (xwidget-buffer session))))
+          (with-current-buffer source
+            (setq my/grip--session session))
+          ;; The back-pointer is what lets `q' and the render toggle put
+          ;; the right buffer back in the window.
+          (when (buffer-live-p preview)
+            (with-current-buffer preview
+              (setq my/grip--source source)
+              ;; xwidget names a new session buffer after the buffer it
+              ;; was created from, so the preview arrives called
+              ;; `foo.md<2>' and reads as a stray second copy of your
+              ;; file.  `xwidget-webkit-callback' renames it on every
+              ;; load, and reloads happen on every refresh, so renaming
+              ;; once is not enough: the format has to be set here too.
+              ;; It is consulted with this buffer current, so a local
+              ;; value wins without touching other xwidget buffers.
+              (let ((name (format "*preview: %s*" (buffer-name source))))
+                (setq-local xwidget-webkit-buffer-name-format
+                            (string-replace "%" "%%" name))
+                (rename-buffer name t))))))
+      ;; Handing the frame a native WebKit view makes it layer-backed,
+      ;; and whatever Emacs has not repainted since keeps a washed-out
+      ;; tint -- which is why the fog starts at the cursor: the lines the
+      ;; cursor has crossed got repainted, the rest did not.  One full
+      ;; redraw settles it.
+      (run-with-timer 0.2 nil #'redraw-display))))
+
+(defun my/grip--setup ()
+  "Turn the sync layer on and off with `grip-mode'."
+  (if (bound-and-true-p grip-mode)
+      (progn
+        (add-hook 'post-command-hook #'my/grip--schedule-sync nil t)
+        (add-hook 'window-scroll-functions #'my/grip--sync-after-scroll nil t))
+    (remove-hook 'post-command-hook #'my/grip--schedule-sync t)
+    (remove-hook 'window-scroll-functions #'my/grip--sync-after-scroll t)
+    (when (timerp my/grip--refresh-timer) (cancel-timer my/grip--refresh-timer))
+    (when (timerp my/grip--sync-timer) (cancel-timer my/grip--sync-timer))
+    (setq my/grip--refresh-timer nil
+          my/grip--sync-timer nil
+          my/grip--session nil)))
+
+(defun my/grip--preview-buffer ()
+  "Return this Markdown buffer's live preview buffer, or nil."
+  (and my/grip--session
+       (xwidget-live-p my/grip--session)
+       (let ((buffer (xwidget-buffer my/grip--session)))
+         (and (buffer-live-p buffer) buffer))))
+
+(defun my/grip--restore-window (window source)
+  "Put SOURCE back in WINDOW, or drop WINDOW if SOURCE is already shown.
+Killing an xwidget on its own leaves its window showing whatever Emacs
+picks next, which is usually a second copy of the Markdown buffer.  That
+is the two-windows-one-buffer mess: side by side, the window is surplus
+and should go; when the preview replaced the text in place, the text
+should come back to it."
+  (when (window-live-p window)
+    (let* ((siblings (window-list (window-frame window)))
+           ;; Deliberately \"some OTHER window\", not `get-buffer-window'.
+           ;; Killing the xwidget makes Emacs pick a replacement buffer
+           ;; for this very window, and it picks the Markdown buffer, so
+           ;; by now `get-buffer-window' happily returns this window and
+           ;; every window ends up holding the same buffer.
+           (elsewhere (seq-find (lambda (w)
+                                  (and (not (eq w window))
+                                       (eq (window-buffer w) source)))
+                                siblings)))
+      (if (and elsewhere (> (length siblings) 1))
+          (delete-window window)
+        (set-window-buffer window source)))))
+
+(defun my/grip--tidy-window-on-stop (original &rest args)
+  "Tidy the preview's window whenever grip tears the preview down.
+Hung on `grip-stop-preview' rather than on the `q' command, because the
+preview also goes away via \\[grip-mode] toggled off, via the render
+toggle, and via `kill-buffer', and all of them leave the same mess: the
+widget dies and Emacs refills its window with whatever it likes, which
+is a second view of the Markdown buffer.  The window has to be captured
+before the teardown, since afterwards there is nothing left to find it
+by."
+  (let* ((preview (my/grip--preview-buffer))
+         (window (and preview (get-buffer-window preview)))
+         (source (current-buffer)))
+    (prog1 (apply original args)
+      (when (and window (buffer-live-p source))
+        (my/grip--restore-window window source)))))
+
+(defun my/grip-quit-preview ()
+  "Close this preview and leave the windows tidy."
+  (interactive)
+  (let ((source my/grip--source))
+    (if (buffer-live-p source)
+        ;; Stopping grip kills the xwidget buffer, with
+        ;; `kill-buffer-query-functions' already bound to nil on its
+        ;; side, and the advice above puts the window right.
+        (with-current-buffer source (grip-mode -1))
+      (quit-window))))
+
+(defun my/markdown-toggle-render ()
+  "Swap this window between the Markdown source and the rendered page.
+The VS Code button, in one window: the browser view replaces the text,
+and running it again brings the text back.  The preview keeps running in
+between, so flipping is instant."
+  (interactive)
+  (cond
+   ;; Already looking at the preview: go back to the text.
+   ((derived-mode-p 'xwidget-webkit-mode)
+    (if (buffer-live-p my/grip--source)
+        (my/grip--restore-window (selected-window) my/grip--source)
+      (user-error "This preview has no Markdown buffer to go back to")))
+
+   ((derived-mode-p 'markdown-mode)
+    (unless (display-graphic-p)
+      (user-error
+       "Rendering needs a graphical frame; use `M-x grip-mode' for your browser"))
+    (let ((source (current-buffer)))
+      (unless (bound-and-true-p grip-mode)
+        ;; grip displays with `pop-to-buffer', which honours this, so the
+        ;; preview lands in this window instead of splitting the frame.
+        (let ((display-buffer-overriding-action '((display-buffer-same-window))))
+          (grip-mode 1)))
+      (let ((preview (my/grip--preview-buffer)))
+        (unless preview
+          (user-error "Preview did not start"))
+        (with-current-buffer preview (setq my/grip--source source))
+        (my/grip-sync-scroll)
+        ;; If it is already on screen elsewhere, go there rather than
+        ;; showing the same widget twice.
+        (let ((window (get-buffer-window preview)))
+          (if window (select-window window) (switch-to-buffer preview))))))
+
+   (t (user-error "Not a Markdown buffer"))))
+
+;; --- crash guard -------------------------------------------------------
+;;
+;; `xwidget-event-handler' logs every single xwidget event, and does it
+;; unconditionally, with no debug flag to turn off:
+;;
+;;   (xwidget-log "stuff happened to xwidget %S" last-input-event)
+;;
+;; That `%S' prints the event, and the event holds the xwidget object.
+;; When the widget has already been destroyed -- stop one preview and
+;; start another, and a WebKit event for the dead widget can still be in
+;; flight -- printing it walks freed memory and takes the entire Emacs
+;; process down.
+;;
+;; This is not a theoretical worry.  It killed this daemon while the
+;; preview was being tested: crash report Emacs-2026-08-06-200908.ips,
+;; SIGSEGV at address 0x8, faulting frames xwidget-log -> styled_format
+;; -> Fprin1_to_string -> print_object -> emacs_abort.
+;;
+;; The log's only reader is a hidden " *xwidget-log*" buffer that nothing
+;; ever looks at, so discarding it costs nothing and removes the exact
+;; frame that crashed.  It narrows the window rather than proving it
+;; shut: the handler still touches the same object afterwards.  Treat
+;; stop-then-immediately-restart as the dangerous move.
+(with-eval-after-load 'xwidget
+  (advice-add 'xwidget-log :override #'ignore))
+
+(use-package grip-mode
+  :ensure t
+  :defer t
+  :config
+  (setq grip-command 'go-grip          ; local render, no GitHub API
+        grip-preview-in-webkit t       ; keep it inside Emacs
+        grip-real-time-refresh t)      ; safe now that it is debounced
+  (advice-add 'grip--refresh :around #'my/grip--refresh-debounced)
+  (advice-add 'grip--browse-url :around #'my/grip--capture-session)
+  (advice-add 'grip-stop-preview :around #'my/grip--tidy-window-on-stop)
+  (add-hook 'grip-mode-hook #'my/grip--setup)
+  (with-eval-after-load 'xwidget
+    (define-key xwidget-webkit-mode-map (kbd "q") #'my/grip-quit-preview)
+    (define-key xwidget-webkit-mode-map (kbd "C-c m r") #'my/markdown-toggle-render))
+  ;; The temp file is grip's, not yours; keep it out of project listings.
+  (with-eval-after-load 'projectile
+    (add-to-list 'projectile-globally-ignored-file-suffixes ".temp.md")))
+
+;; ============================================================
+;; 14. Theme (kept last: everything it themes is configured above)
 ;; ============================================================
 
 (use-package doom-themes
