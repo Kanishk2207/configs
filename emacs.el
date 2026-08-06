@@ -17,7 +17,8 @@
 ;;   9.  Whitespace & TODO highlighting
 ;;   10. LSP core (lsp-mode, lsp-ui, consult-lsp, navigation keys)
 ;;   10c. Debugging (dape / Debug Adapter Protocol)
-;;   11. Languages: Python, Go, Rust, Clojure, Elixir, TS/JS, Terraform/HCL
+;;   11. Languages: Python, Go, Rust, Clojure, Elixir, TS/JS, Terraform/HCL,
+;;       GitHub Actions workflows
 ;;   12. Theme (always last)
 ;;
 ;; Daemon notes:
@@ -4149,6 +4150,172 @@ Prelude's clojure hooks never fire there on their own."
   (add-hook 'terraform-ts-mode-hook #'my/terraform-hcl-setup))
 (when (fboundp 'hcl-ts-mode)
   (add-hook 'hcl-ts-mode-hook #'my/terraform-hcl-setup))
+
+;; ============================================================
+;; 11i. GitHub Actions workflows
+;; ============================================================
+;;
+;; Two tools, covering different halves of the problem:
+;;
+;;   gh-actions-language-server -- GitHub's own workflow language
+;;     service, the same one behind the VS Code GitHub Actions
+;;     extension.  Upstream publishes it as `@actions/languageserver'
+;;     with no `bin' entry (actions/languageservices#56), so it cannot
+;;     be launched directly; `gh-actions-language-server' is a thin
+;;     wrapper package that adds the executable.  Install with:
+;;       npm install -g gh-actions-language-server
+;;     It answers completion, hover and document links, and pushes
+;;     diagnostics.  No formatting and no go-to-definition -- those
+;;     capabilities are simply absent from its initialize reply, which
+;;     is why it is registered as an add-on below.
+;;
+;;     What the completion actually covers, measured against this
+;;     version: workflow and job and step keys, `on:' event names,
+;;     `runs-on:' runner labels, and -- the useful one -- `${{ }}'
+;;     expression contexts, including drilling into `github.',
+;;     `needs.', `steps.' and friends.  It does NOT complete the
+;;     `with:' inputs of a referenced action, even though it does
+;;     validate them (a misspelt `fetch-dept:' on actions/checkout is
+;;     reported as an error), so that gap is a server limitation, not
+;;     a missing token.
+;;
+;;   actionlint -- static checker that goes well past the schema:
+;;     `${{ }}' expression type checking, runner label typos, glob and
+;;     cron syntax, and shellcheck run over every `run:' block.
+;;       brew install actionlint     (pulls in shellcheck)
+;;
+;; Both are scoped to `.github/workflows/'.  YAML anywhere else is left
+;; alone, which also means a plain YAML buffer still starts no server
+;; (yaml-language-server is not installed here).
+
+(defconst my/gh-actions-workflow-regexp
+  (rx ".github/workflows/" (+ (not (any "/"))) ".y" (opt "a") "ml" eos)
+  "Path pattern matching a GitHub Actions workflow file.")
+
+(defun my/gh-actions-workflow-p (&optional file)
+  "Return non-nil when FILE is a GitHub Actions workflow.
+FILE defaults to the current buffer's file."
+  (let ((name (or file buffer-file-name)))
+    (and name (string-match-p my/gh-actions-workflow-regexp name))))
+
+;; --- Language server ---------------------------------------------------
+;;
+;; A token is what unlocks the second half of this server.  Without one
+;; it checks workflows against the bundled schema and nothing more; with
+;; one it also fetches the `action.yml' of every action a step
+;; references, which is what makes a typo in a `with:' key an error
+;; rather than silently ignored input.  Read once from the gh CLI, which
+;; already holds a keyring token here.
+;;
+;; The server takes one further option, `repos', a list of repositories
+;; to pull live secret / variable / environment names from.  Not set:
+;; supplying it means resolving numeric repo ids up front, and the
+;; payoff is only that `${{ secrets. }}' lists more than GITHUB_TOKEN.
+;;
+;; The token is passed as an initialize option, so it lands in the
+;; *lsp-log* buffer if `lsp-log-io' is ever turned on for this server.
+(defvar my/gh-actions-session-token 'unset
+  "Cached GitHub token for the Actions language server.
+The value `unset' means \"not looked up yet\"; nil means \"looked up
+and unavailable\", so a missing token is not re-probed on every start.")
+
+(defun my/gh-actions-session-token ()
+  "Return a GitHub token for the Actions language server, or nil."
+  (when (eq my/gh-actions-session-token 'unset)
+    (setq my/gh-actions-session-token
+          (let ((token (or (getenv "GITHUB_TOKEN")
+                           (when-let* ((gh (executable-find "gh")))
+                             (ignore-errors
+                               (car (process-lines gh "auth" "token")))))))
+            (and (stringp token)
+                 (not (string-empty-p (string-trim token)))
+                 (string-trim token)))))
+  my/gh-actions-session-token)
+
+(defun my/gh-actions-initialization-options ()
+  "Build the initialize options for the Actions language server.
+Never returns nil.  The server reads `initializationOptions.sessionToken'
+without a null guard, so a null object makes it die during initialize --
+silently, with no response and no stderr.  Keeping `userAgent' in
+unconditionally guarantees a non-empty object even with no token."
+  (append (list :userAgent "emacs-lsp-mode")
+          (when-let* ((token (my/gh-actions-session-token)))
+            (list :sessionToken token))))
+
+(with-eval-after-load 'lsp-mode
+  ;; `:add-on? t' rather than a priority: this server handles one narrow
+  ;; slice of YAML and provides no formatting, so it should never win the
+  ;; language id "yaml" outright.  lsp-mode starts add-on clients
+  ;; alongside the main client, and on their own when there is no main
+  ;; client -- which is the case today, and stays correct if
+  ;; yaml-language-server is installed later.
+  (lsp-register-client
+   (make-lsp-client
+    :new-connection (lsp-stdio-connection
+                     (lambda ()
+                       (list (executable-find "gh-actions-language-server")
+                             "--stdio"))
+                     (lambda ()
+                       (executable-find "gh-actions-language-server")))
+    ;; Path-based, not mode-based: `.github/workflows/ci.yml' only.
+    :activation-fn (lambda (filename _mode) (my/gh-actions-workflow-p filename))
+    :initialization-options #'my/gh-actions-initialization-options
+    :add-on? t
+    :server-id 'gh-actions-ls)))
+
+(defun my/gh-actions-setup ()
+  "Start LSP in GitHub Actions workflow buffers only."
+  (when (my/gh-actions-workflow-p)
+    (lsp-deferred)))
+
+(add-hook 'yaml-mode-hook #'my/gh-actions-setup)
+(add-hook 'yaml-ts-mode-hook #'my/gh-actions-setup)
+
+;; --- actionlint --------------------------------------------------------
+;;
+;; Flycheck already ships the `yaml-actionlint' checker, gated on the same
+;; `.github/workflows' path test used above, so there is nothing to
+;; define.  It just has to be chained behind lsp-mode's checker, exactly
+;; as golangci-lint is in the Go section -- see the long comment there for
+;; why this hangs off `lsp-diagnostics-mode-hook' and not a
+;; `with-eval-after-load'.
+;;
+;; `warning' as the chain level means actionlint runs only once the
+;; server itself is happy.  That is deliberate: the two overlap on
+;; `with:' input names and would otherwise double-report them.  Fix what
+;; the server flags, then actionlint layers on the checks it cannot see
+;; -- expression typing and shellcheck over `run:'.  Change the level to
+;; a bare `yaml-actionlint' to run both unconditionally instead.
+(defvar my/actionlint-chained nil
+  "Non-nil once actionlint has been chained behind the `lsp' checker.")
+
+(defun my/chain-actionlint ()
+  "Append `yaml-actionlint' to the `lsp' checker's next-checkers, once."
+  (unless my/actionlint-chained
+    (when (and (fboundp 'flycheck-valid-checker-p)
+               (flycheck-valid-checker-p 'lsp)
+               (flycheck-valid-checker-p 'yaml-actionlint))
+      (flycheck-add-next-checker 'lsp '(warning . yaml-actionlint) t)
+      (setq my/actionlint-chained t))))
+
+(add-hook 'lsp-diagnostics-mode-hook #'my/chain-actionlint)
+
+(defun my/gh-actions-lint-project ()
+  "Run actionlint over every workflow in the project, in a compilation buffer.
+The flycheck checker only sees the current buffer; this is the whole-repo
+sweep, and the same thing CI would run."
+  (interactive)
+  (let ((default-directory (or (and (fboundp 'projectile-project-root)
+                                    (projectile-project-root))
+                               default-directory)))
+    (compile "actionlint -oneline")))
+
+;; `C-c G l' on purpose: the same chord the Go section uses for its
+;; whole-project lint sweep, so there is one key to remember.
+(with-eval-after-load 'yaml-mode
+  (define-key yaml-mode-map (kbd "C-c G l") #'my/gh-actions-lint-project))
+(with-eval-after-load 'yaml-ts-mode
+  (define-key yaml-ts-mode-map (kbd "C-c G l") #'my/gh-actions-lint-project))
 
 ;; ============================================================
 ;; 12. Theme (kept last: everything it themes is configured above)
